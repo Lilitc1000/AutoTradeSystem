@@ -1,0 +1,73 @@
+# AutoTradeSystem 开发环境（devcontainer）
+#
+# 三服务：app（开发容器）+ db（PostgreSQL）+ redis。
+# app 把仓库挂载到 /workspace，SSH 端口 2223 映射到容器 22 ——
+# Windows 侧通过 ~/.workbuddy/bin/ats.py 远程执行命令/读写文件，
+# 容器内对 /workspace 的任何修改直接落在 WSL 文件系统上。
+#
+# 启动（一次性，在 WSL 终端执行）：
+#   cd /home/autotoll/repos/AutoTradeSystem
+#   python3 scripts/ensure_env.py --env dev
+#   docker compose -f .devcontainer/docker-compose.devcontainer.yml up -d --build
+#
+# 端口：2223=SSH(ats.py)  8000=api_dashboard(M2+)  5432=PG  6379=Redis
+# 注意：2223/5432/6379 与 doc_process_studio 的 devcontainer（2222）错开，可并行运行。
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    privileged: true
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-autotrade}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-autotrade}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_KEY_PREFIX=autotrade
+    volumes:
+      - ..:/workspace:delegated
+    ports:
+      - "2223:22"
+      - "8000:8000"
+    command: bash -lc '/workspace/.devcontainer/startup.sh'
+
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-autotrade}
+      # 密码来自 .devcontainer/.env（scripts/ensure_env.py 生成）；缺失即报错，防止空密码初始化数据卷
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?缺少 POSTGRES_PASSWORD —— 先运行 python3 scripts/ensure_env.py --env dev}
+      POSTGRES_DB: ${POSTGRES_DB:-autotrade}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-autotrade} -d ${POSTGRES_DB:-autotrade}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?缺少 REDIS_PASSWORD —— 先运行 python3 scripts/ensure_env.py --env dev}", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
