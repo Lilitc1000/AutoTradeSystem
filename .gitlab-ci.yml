@@ -1,0 +1,31 @@
+# CI 门禁（对齐 doc_process_studio 规范）：
+# lint：ruff + mypy（disallow_untyped_defs）
+# test：pytest 全量
+# 任一红即拒绝合并。
+stages:
+  - lint
+  - test
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+default:
+  image: python:3.12-slim
+  before_script:
+    - pip install -e "backend[dev]"
+
+ruff:
+  stage: lint
+  script:
+    - ruff check backend/
+    - ruff format --check backend/
+
+mypy:
+  stage: lint
+  script:
+    - mypy backend/src
+
+pytest:
+  stage: test
+  script:
+    - pytest backend/tests --cov=backend/src --cov-report=term-missing
