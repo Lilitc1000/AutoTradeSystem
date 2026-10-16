@@ -6,7 +6,7 @@
 - 用户说明书：`docs/user_manual.html`
 - 技术设计文档：`docs/design/technical_design.html`
 
-## 当前进度：M2-b 账号验证通过 + M2-c 环境固化（commit 见 git log）
+## 当前进度：M2-d 真连实现已完成（commit 见 git log）
 
 - **M0-a**：领域模型（五聚合根 + Signal）+ 领域服务（PositionSizer 四层取小 /
   RiskEngine 硬规则 fail-closed）+ 应用层四端口 + BacktestBroker 最小回测闭环。
@@ -181,9 +181,13 @@ backend/src/futures_trading/
 4. 显式状态优于隐式假设——订单状态机 + 重启强制对账，无单例全局状态
 5. 可观测即默认——每个信号、每次风控拒绝全量落库
 
-## 下一步：M2-d（CTP 适配器真连）+ M3（前端）
+## 下一步：M3（前端）
 
-- M2-d：CtpMarketData/CtpTradeGateway 补 spi 回调真连（登录已验证，
-  剩订阅/报单/回报/对账）；影子 → SIM 切换；tick→bar 聚合接总线
-- M3：前端 dashboard（回测报告/曲线/持仓/信号）+ settings 页
-  （SimNow 凭证从 .env 迁入 system_secrets 加密存储，复刻 DPS 模式）
+M2 全部完成（a 骨架 / b 账号 / c 环境 / d 真连）。**仅剩真连实跑验证**
+（日盘 9:00-15:00 做市活跃期）——代码层已完成，账号已在 .env：
+1. `--source ctp` 收真实 tick → 聚合 → 总线 → strategy_core 影子决策
+2. `--mode sim` 真实报单 → SimNow 成交回报 → 持仓应用
+3. 若仍 0 tick：查 SimNow 做市/账号限制（已排除代码层，见上）
+
+M3：前端 dashboard（回测报告/曲线/持仓/信号）+ settings 页
+（SimNow 凭证从 .env 迁入 system_secrets 加密存储，复刻 DPS 模式）
