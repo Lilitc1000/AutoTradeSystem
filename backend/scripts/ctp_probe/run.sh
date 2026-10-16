@@ -3,7 +3,8 @@
 # 用法: docker exec devcontainer-app-1 bash /workspace/backend/scripts/ctp_probe/run.sh [前端地址]
 set -eu
 
-SRC=/tmp/openctp-master/ctpapi-python/CTPAPI/linux
+# CTP 头文件+官方 so 由 Dockerfile build 阶段固化到 /opt/ctp
+SRC=/opt/ctp
 PROBE=/workspace/backend/scripts/ctp_probe
 
 echo '=== 编译 md_login ==='

@@ -63,4 +63,10 @@ COPY backend/scripts/ctp_probe/patch_gbk.sh /tmp/patch_gbk.sh
 RUN bash /tmp/patch_gbk.sh \
     && rm /tmp/patch_gbk.sh
 
+# CTP C++ 头文件 + 官方预编译 so 固化到 /opt/ctp（探针/联调用）。
+# 不依赖 /tmp（容器重建即丢——M2-c 曾因此导致 C++ 探针编译失败）。
+COPY backend/scripts/ctp_probe/fetch_ctp_headers.sh /tmp/fetch_ctp_headers.sh
+RUN bash /tmp/fetch_ctp_headers.sh \
+    && rm /tmp/fetch_ctp_headers.sh
+
 EXPOSE 22

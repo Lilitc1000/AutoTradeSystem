@@ -1,7 +1,7 @@
-// CTP 登录连通性探针（M2-b 联调用）
-// 用途：验证 SimNow 账号密码 + 前置连通性，不依赖 Python 绑定
-// 构建：g++ -std=c++11 -I<ctp头文件目录> md_login.cpp -L<so目录> -lthostmduserapi_se -lthosttraderapi_se -Wl,-rpath,<so目录> -o md_login
-// 运行：./md_login <BrokerID> <UserID> <Password> [FrontAddr]
+// CTP 登录 + 行情订阅探针（C++ 对照验证，M2-d 前置）。
+// 用途：验证 SimNow 行情推送（绕开 openctp Python 层）。
+// 构建：run.sh（g++ -I /opt/ctp，链官方 so）。
+// 运行：run.sh [FrontAddr]
 
 #include <cstdio>
 #include <cstring>
@@ -20,6 +20,7 @@ public:
     int request_id = 0;
     bool front_connected = false;
     bool login_done = false;
+    int tick_count = 0;
 
     void OnFrontConnected() override {
         front_connected = true;
@@ -44,12 +45,34 @@ public:
         if (pRspInfo && pRspInfo->ErrorID != 0) {
             std::printf("[probe] 登录失败 ErrorID=%d ErrorMsg=%s\n",
                         pRspInfo->ErrorID, pRspInfo->ErrorMsg);
-        } else if (pRspUserLogin) {
-            std::printf("[probe] 登录成功 BrokerID=%s UserID=%s TradingDay=%s\n",
-                        pRspUserLogin->BrokerID, pRspUserLogin->UserID,
-                        pRspUserLogin->TradingDay);
+            std::fflush(stdout);
+            return;
         }
+        std::printf("[probe] 登录成功 TradingDay=%s\n",
+                    pRspUserLogin ? pRspUserLogin->TradingDay : "?");
         std::fflush(stdout);
+        // 订阅行情（TEST/BTC/MINUS 为 7x24 环境模拟合约）
+        char* insts[] = {(char*)"TEST", (char*)"BTC", (char*)"MINUS", (char*)"rb2601"};
+        api->SubscribeMarketData(insts, 4);
+    }
+
+    void OnRspSubMarketData(CThostFtdcSpecificInstrumentField* pSpecific,
+                            CThostFtdcRspInfoField* pRspInfo,
+                            int nRequestID, bool bIsLast) override {
+        std::printf("[probe] sub %s %s\n",
+                    pSpecific ? pSpecific->InstrumentID : "?",
+                    (pRspInfo && pRspInfo->ErrorID != 0) ? "FAIL" : "OK");
+        std::fflush(stdout);
+    }
+
+    void OnRtnDepthMarketData(CThostFtdcDepthMarketDataField* p) override {
+        tick_count++;
+        if (tick_count <= 5) {
+            std::printf("[probe] tick %s last=%s vol=%d time=%s.%d\n",
+                        p->InstrumentID, p->LastPrice, p->Volume,
+                        p->UpdateTime, p->UpdateMillisec);
+            std::fflush(stdout);
+        }
     }
 
     void OnRspError(CThostFtdcRspInfoField* pRspInfo, int nRequestID, bool bIsLast) override {
@@ -66,7 +89,7 @@ int main(int argc, char** argv) {
         std::printf("用法: %s <BrokerID> <UserID> <Password> [FrontAddr]\n", argv[0]);
         return 2;
     }
-    const char* front = argc > 4 ? argv[4] : "tcp://180.168.146.187:10131";
+    const char* front = argc > 4 ? argv[4] : "tcp://182.254.243.31:40011";
 
     LoginSpi spi{};
     std::strncpy(spi.broker, argv[1], sizeof(spi.broker) - 1);
@@ -80,15 +103,20 @@ int main(int argc, char** argv) {
     api->RegisterFront(const_cast<char*>(front));
     api->Init();
 
-    // 等待登录结果（最多 25 秒）
+    // 等待登录（最多 25 秒），成功后再等 50 秒收 tick
     for (int i = 0; i < 250 && !spi.login_done; ++i) {
         usleep(100000);
     }
     if (!spi.login_done) {
         std::printf("[probe] 超时：25 秒内未完成登录（front_connected=%d）\n",
                     spi.front_connected ? 1 : 0);
+    } else {
+        std::printf("[probe] 等待行情推送（50 秒）...\n");
+        for (int i = 0; i < 500 && spi.tick_count == 0; ++i) {
+            usleep(100000);
+        }
     }
     api->Release();
-    std::printf("[probe] 退出\n");
+    std::printf("[probe] 退出，共 %d tick\n", spi.tick_count);
     return spi.login_done ? 0 : 1;
 }
