@@ -55,6 +55,12 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ARG"]
 
+[tool.ruff.lint.per-file-ignores]
+# CTP spi 回调签名由 C++ 接口固定（OnRtnXxx(pXxx, pRspInfo, nRequestID, bIsLast)），
+# 未使用的参数是协议的一部分，不是代码异味
+"src/futures_trading/trading/infrastructure/ctp/adapters.py" = ["ARG002"]
+"tests/infrastructure/test_ctp_adapters.py" = ["ARG002", "SLF001"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

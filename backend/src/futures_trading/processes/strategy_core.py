@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import redis.asyncio as redis
@@ -56,7 +56,7 @@ async def _heartbeat() -> None:
     key = f"{settings.redis_key_prefix}:proc:strategy_core:hb"
     try:
         while True:
-            await client.set(key, datetime.now(timezone.utc).isoformat(), ex=15)
+            await client.set(key, datetime.now(UTC).isoformat(), ex=15)
             await asyncio.sleep(5)
     finally:
         await client.aclose()

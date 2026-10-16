@@ -17,8 +17,8 @@ from ..application.signal_pipeline import SignalOutcome, SignalPipeline
 from ..application.strategy import SignalGenerator, make_generator
 from ..domain.model.instrument import Instrument
 from ..domain.model.order import Offset
-from ..domain.model.position import Fill
 from ..domain.model.portfolio import Portfolio, PortfolioConstraints
+from ..domain.model.position import Fill
 from ..domain.model.strategy import InstanceMode, StrategyInstance, StrategyType
 from ..domain.service.risk_engine import RiskEngine
 from ..infrastructure.backtest.backtest_broker import BacktestBroker
