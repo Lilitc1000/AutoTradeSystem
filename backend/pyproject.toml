@@ -3,13 +3,22 @@ name = "futures-trading"
 version = "0.1.0"
 description = "期货自动交易系统：多品种 · 多策略 · 回测实盘同构"
 requires-python = ">=3.12"
-# M0 领域层零第三方依赖：纯标准库，保证任何环境可测
-dependencies = []
+# M0-b 起引入基础设施依赖（领域层仍保持纯标准库）
+dependencies = [
+  "sqlalchemy[asyncio]>=2.0",
+  "asyncpg>=0.29",
+  "alembic>=1.13",
+  "pydantic-settings>=2.3",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "redis>=5.2",
+]
 
 [dependency-groups]
 dev = [
   "pytest>=8.3.0",
   "pytest-cov>=5.0.0",
+  "pytest-asyncio>=0.24",
   "ruff>=0.6.0",
   "mypy>=1.11.0",
 ]
@@ -30,6 +39,7 @@ disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
 enable_error_code = "ignore-without-code"
+# 注：SQLAlchemy 2.1 起 ext.mypy.plugin 已移除，Mapped[] 原生类型标注 mypy 直接支持
 
 [tool.ruff]
 target-version = "py312"
@@ -41,3 +51,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "ARG"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+asyncio_mode = "auto"
+markers = [
+  "db: 需要真实 PostgreSQL 的持久化测试（未配置 ATS_TEST_DATABASE_URL/DATABASE_URL 时自动跳过）",
+]

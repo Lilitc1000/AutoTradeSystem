@@ -110,7 +110,16 @@ def _norm_remote(path: str) -> str:
 def cmd_exec(cmd, cwd=REMOTE_ROOT):
     client = connect()
     try:
-        full = f"cd {cwd} && {cmd}" if cwd else cmd
+        # SSH 会话不继承 compose environment（sshd 环境隔离）。
+        # 加载 .env 的零件后，按 compose 同款规则重组装 DATABASE_URL / REDIS_URL。
+        prefix = (
+            "set -a; "
+            f"[ -f {REMOTE_ROOT}/.devcontainer/.env ] && . {REMOTE_ROOT}/.devcontainer/.env; "
+            '[ -z "$DATABASE_URL" ] && export DATABASE_URL="postgresql+asyncpg://${POSTGRES_USER:-autotrade}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-autotrade}"; '
+            '[ -z "$REDIS_URL" ] && export REDIS_URL="redis://:${REDIS_PASSWORD}@redis:6379"; '
+            "set +a; "
+        )
+        full = f"cd {cwd} && {prefix}{cmd}" if cwd else f"{prefix}{cmd}"
         _, out, err = client.exec_command(full, timeout=300)
         code = out.channel.recv_exit_status()
         so = out.read().decode("utf-8", "replace")

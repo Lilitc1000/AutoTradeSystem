@@ -6,14 +6,16 @@
 - 用户说明书：`docs/user_manual.html`
 - 技术设计文档：`docs/design/technical_design.html`
 
-## 当前进度：M0-a 已完成（commit 27730a6）
+## 当前进度：M0-b 已完成（commit 见 git log）
 
-领域模型（五聚合根 + Signal）+ 领域服务（PositionSizer 四层取小 /
-RiskEngine 硬规则 fail-closed）+ 应用层四端口 + BacktestBroker 最小回测闭环。
+- **M0-a**：领域模型（五聚合根 + Signal）+ 领域服务（PositionSizer 四层取小 /
+  RiskEngine 硬规则 fail-closed）+ 应用层四端口 + BacktestBroker 最小回测闭环。
+- **M0-b**：PG 持久层（14 张表 ORM + alembic 0001 初始迁移）+ 4 进程骨架
+  （ProcessBase：信号处理/优雅退出/Redis 心跳）+ api_dashboard /healthz。
 
-**质量数据**：110 项单元测试通过；ruff + mypy(strict) 零问题；
-domain 层覆盖率 92%（设计文档要求 ≥ 90%）。已在 devcontainer 内复跑验证
-（Python 3.13.16，结果与本地一致）。
+**质量数据**：115 项测试通过（含 5 项真实 PG 集成测试，db marker）；
+ruff + mypy(strict) 零问题；容器内 `alembic upgrade head` 成功，
+4 进程起停/优雅退出/心跳/healthz 全链路验证通过。
 
 ## 开发环境：devcontainer（复刻 doc_process_studio 模式）
 
@@ -43,6 +45,8 @@ ATS="C:/Users/autotoll/.workbuddy/bin/ats.py"   # 主副本；repo scripts/ats.p
 
 "$PY" "$ATS" exec "cd backend && PYTHONPATH=src python3 -m pytest tests -q"   # 跑测试
 "$PY" "$ATS" exec "cd backend && PYTHONPATH=src python3 scripts/run_minimal_backtest.py"
+"$PY" "$ATS" exec "cd backend && alembic upgrade head"                        # 数据库迁移
+"$PY" "$ATS" exec "cd backend && PYTHONPATH=src python3 -m futures_trading.processes.md_gateway"  # 起进程
 "$PY" "$ATS" ls /workspace/backend               # 列目录
 "$PY" "$ATS" cat /workspace/backend/src/x.py     # 读文件
 "$PY" "$ATS" put 本地文件.py backend/src/远端.py  # 覆盖上传（绕开 UNC 限制）
@@ -71,6 +75,15 @@ ATS="C:/Users/autotoll/.workbuddy/bin/ats.py"   # 主副本；repo scripts/ats.p
    modified（100644 → 100755），Windows 侧因 core.fileMode=false 看不见——
    本仓库脚本统一 644（均由 bash/python 显式调用）；每次改动后以 **WSL 侧
    git status** 为准。
+6. **sshd 不继承 compose environment**：SSH 会话里没有 DATABASE_URL——
+   ats.py 的 exec 已自动 source `.devcontainer/.env` 并按 compose 同款规则
+   重组装 DATABASE_URL / REDIS_URL。
+7. **容器内装依赖**：`sudo uv pip install --system -e . --group dev`
+   （`.[dev]` 语法 pip/uv 都不认 dependency-groups；系统 Python 需 sudo）。
+8. **async lazy load**：AsyncSession 访问 relationship 会抛 MissingGreenlet，
+   查询必须 eager load；集合用 selectinload（joinedload 一对多要求 .unique()）。
+9. **容器内 redis-cli/psql**：服务在独立容器，要显式 `-h redis` / `-h db`；
+   psql 不认 `postgresql+asyncpg://` 前缀，用 `${DATABASE_URL/+asyncpg/}` 转换。
 
 ## 开发
 
@@ -103,7 +116,8 @@ backend/src/futures_trading/
 4. 显式状态优于隐式假设——订单状态机 + 重启强制对账，无单例全局状态
 5. 可观测即默认——每个信号、每次风控拒绝全量落库
 
-## 下一步：M0-b
+## 下一步：M1（回测系统）
 
-PG 持久层（SQLAlchemy + alembic，12 张表）+ 4 进程空跑。
-（docker-compose devcontainer 已就绪：db/redis/app 三服务，SSH 2223）
+BacktestMarketData + BacktestBroker 事件驱动回测 + 历史数据导入（akshare）
++ 两级报告（实例级/组合级）+ 参数扫描。领域层与 M0-a 的 BacktestBroker 对接，
+Strategy Engine 接正式回测循环。
