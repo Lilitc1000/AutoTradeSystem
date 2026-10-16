@@ -25,5 +25,16 @@ class Settings(BaseSettings):
     redis_url: str = "redis://:autotrade@redis:6379"
     redis_key_prefix: str = "autotrade"
 
+    # CTP / SimNow（M2-b 联调；凭证走 .env，M3 迁入 settings 页加密存储）
+    # SimNow 2025-06 迁址：第一套(仿真) 30011/30001 跟随交易时段；
+    # 7x24 40011/40001 服务时间 16:00~次日09:00（新用户第三交易日后可用第二套）
+    simnow_user_id: str = ""
+    simnow_password: str = ""
+    simnow_app_id: str = "simnow_client_test"
+    simnow_auth_code: str = "0000000000000000"
+    ctp_broker_id: str = "9999"
+    ctp_md_front: str = "tcp://182.254.243.31:40011"
+    ctp_trade_front: str = "tcp://182.254.243.31:40001"
+
 
 settings = Settings()

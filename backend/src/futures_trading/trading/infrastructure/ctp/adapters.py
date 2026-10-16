@@ -48,8 +48,8 @@ class CtpConfig:
         password: str = "",
         app_id: str = "simnow_client_test",
         auth_code: str = "0000000000000000",
-        md_front: str = "tcp://180.168.146.187:10131",
-        trade_front: str = "tcp://180.168.146.187:10130",
+        md_front: str = "tcp://182.254.243.31:40011",
+        trade_front: str = "tcp://182.254.243.31:40001",
     ) -> None:
         self.broker_id = broker_id
         self.user_id = user_id
