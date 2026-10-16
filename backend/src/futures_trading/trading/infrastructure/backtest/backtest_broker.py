@@ -104,6 +104,13 @@ class BacktestBroker:
             filled.append(order)
         return filled
 
+    def on_bar_all(self, bars: dict[str, Bar]) -> list[Order]:
+        """多品种同时刻撮合（回测引擎用）。"""
+        filled: list[Order] = []
+        for bar in bars.values():
+            filled.extend(self.on_bar(bar))
+        return filled
+
     def _execution_price(self, order: Order, bar: Bar) -> Price | None:
         """返回本根 bar 上该订单的成交价；不可成交返回 None。"""
         if order.price_type is PriceType.MARKET:
@@ -137,6 +144,7 @@ class BacktestBroker:
         fill = Fill(quantity=quantity, price=price)
         lots = int(Decimal(quantity))
         commission = self._slippage.commission(lots)
+        realized: Decimal | None = None
         if order.offset is Offset.OPEN:
             position.add(fill)
             self.balance = Money(Decimal(self.balance) - Decimal(commission))
@@ -153,6 +161,8 @@ class BacktestBroker:
                 "quantity": quantity,
                 "price": price,
                 "commission": commission,
+                "pnl": realized,  # 仅平仓成交有值（毛盈亏，未扣手续费）
+                "ts": order.updated_at,
                 "balance": self.balance,
             }
         )

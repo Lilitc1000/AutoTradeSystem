@@ -39,12 +39,21 @@ async def db() -> Database:
     """真实 PostgreSQL（ATS_TEST_DATABASE_URL 或 DATABASE_URL 设置时可用）。
 
     未设置时自动跳过（对齐 doc_process_studio 的 db marker 模式）。
+    表结构由 alembic 管理（真相源）；本 fixture 只负责幂等建表与测试后清数据——
+    绝不 drop_all（那会删掉 alembic 的成果，曾导致 API 冒烟时 relation 不存在）。
     """
     url = os.getenv("ATS_TEST_DATABASE_URL") or os.getenv("DATABASE_URL")
     if not url:
         pytest.skip("未设置 ATS_TEST_DATABASE_URL / DATABASE_URL，跳过真实 PG 测试")
+    from sqlalchemy import text
+
+    from futures_trading.trading.infrastructure.persistence.base import Base
+
     database = Database(url)
-    await database.create_all()
+    async with database.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)  # 幂等：已存在则跳过
     yield database
-    await database.drop_all()
+    async with database.engine.begin() as conn:
+        for table in reversed(Base.metadata.sorted_tables):
+            await conn.execute(text(f'DELETE FROM "{table.name}"'))
     await database.dispose()

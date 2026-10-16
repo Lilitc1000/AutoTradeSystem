@@ -1,6 +1,7 @@
 """api_dashboard：监控面板 API 进程。
 
-M0 最小可用：/healthz 检查 db + redis + 四进程心跳。
+- /healthz：db + redis + 三 worker 心跳
+- /api/backtest/*：回测任务 / 报告 / 参数扫描（M1）
 只读观测 + 显式干预指令，永不直接下单（设计文档 2.2）。
 """
 
@@ -15,6 +16,7 @@ from sqlalchemy import text
 
 from ..common.settings import settings
 from ..trading.infrastructure.persistence.database import database
+from ..trading.router.backtest import router as backtest_router
 
 # 被监控的 worker 进程（写 Redis 心跳）。api_dashboard 自身不在列——
 # 能访问到 healthz 即证明它活着。
@@ -28,6 +30,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="AutoTradeSystem Dashboard API", version="0.1.0", lifespan=lifespan)
+app.include_router(backtest_router)
 
 
 @app.get("/healthz")

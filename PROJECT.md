@@ -6,16 +6,22 @@
 - 用户说明书：`docs/user_manual.html`
 - 技术设计文档：`docs/design/technical_design.html`
 
-## 当前进度：M0-b 已完成（commit 见 git log）
+## 当前进度：M1 回测系统已完成（commit 见 git log）
 
 - **M0-a**：领域模型（五聚合根 + Signal）+ 领域服务（PositionSizer 四层取小 /
   RiskEngine 硬规则 fail-closed）+ 应用层四端口 + BacktestBroker 最小回测闭环。
 - **M0-b**：PG 持久层（14 张表 ORM + alembic 0001 初始迁移）+ 4 进程骨架
   （ProcessBase：信号处理/优雅退出/Redis 心跳）+ api_dashboard /healthz。
+- **M1**：事件驱动回测引擎（BacktestClock/MarketData/Engine + SignalPipeline
+  回测实盘共用）+ TrendATR 策略 + 两级指标（含 avg_loss_vs_budget 王牌指标）
+  + Parquet 数据层 + akshare 导入 + 参数扫描（≤2 参数）+ 回测 API
+  （jobs/scan/runs/reports，报告落 PG）。
 
-**质量数据**：115 项测试通过（含 5 项真实 PG 集成测试，db marker）；
-ruff + mypy(strict) 零问题；容器内 `alembic upgrade head` 成功，
-4 进程起停/优雅退出/心跳/healthz 全链路验证通过。
+**质量数据**：145 项测试通过（含真实 PG 集成）；ruff + mypy(strict) 零问题。
+**真实数据首测结论**（12 年 rb 日线）：默认参数无效（-0.21%），9 组参数扫描
+无一为正——单品种日线双均线样本不足（0-12 笔/12年），且日线止损跳空滑点
+使 avg_loss_vs_budget 达 518%（该指标正确暴露了日线频率的固有限制，
+反证 15 分钟策略方向的正确性：分钟级止损滑点小得多）。
 
 ## 开发环境：devcontainer（复刻 doc_process_studio 模式）
 
