@@ -27,15 +27,21 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 def _load_ctp() -> tuple[Any, Any]:
-    """懒加载 CTP API（返回 (md_api, trade_api) 模块）。"""
+    """懒加载 CTP API（返回 (md_api, trade_api) 模块）。
+
+    注意：openctp_ctp 的 .so 需经 patch_gbk.sh 修补
+    （zh_CN.GB18030 → C）才能 import，否则静态初始化 abort——
+    修补已在 Dockerfile build 阶段完成。
+    """
     try:
-        from openctp_ctp import thostmduserapi_se, thosttraderapi_se  # noqa: PLC0415
+        from openctp_ctp import thostmduserapi as md_api
+        from openctp_ctp import thosttraderapi as td_api
     except ImportError as exc:  # pragma: no cover - 环境相关
         raise RuntimeError(
             "openctp_ctp 未安装或不可加载（Linux C++ 扩展）。"
             "M2-b 联调前执行: pip install openctp-ctp 并确认容器 locale 正常"
         ) from exc
-    return thostmduserapi_se, thosttraderapi_se
+    return md_api, td_api
 
 
 class CtpConfig:

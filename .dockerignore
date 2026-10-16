@@ -1,0 +1,6 @@
+# build context 排除（.devcontainer/docker-compose build context: ..）
+.git
+data
+**/__pycache__
+**/*.pyc
+.venv

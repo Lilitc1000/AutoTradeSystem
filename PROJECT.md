@@ -6,7 +6,7 @@
 - 用户说明书：`docs/user_manual.html`
 - 技术设计文档：`docs/design/technical_design.html`
 
-## 当前进度：M2-a 影子模式已完成（commit 见 git log）
+## 当前进度：M2-b 账号验证通过 + M2-c 环境固化（commit 见 git log）
 
 - **M0-a**：领域模型（五聚合根 + Signal）+ 领域服务（PositionSizer 四层取小 /
   RiskEngine 硬规则 fail-closed）+ 应用层四端口 + BacktestBroker 最小回测闭环。
@@ -32,6 +32,43 @@
    联调时若仍 abort 需专项排查（localedef / glibc 版本）
 4. CTP 适配器补真连：CreateFtdcMdApi/TraderApi + spi 回调 + 登录/订阅/报单
 5. 影子 → SIM 切换：OrderPort 从 BacktestBroker 切 CtpTradeGateway
+
+## M2-b/c 已完成（2026-10-16 晚）
+
+**账号验证**：SimNow 账号 7x24 环境 CTP API 登录成功（BrokerID=9999，
+TradingDay=20261015）。**迁址根因**：SimNow 2025-06-19 迁址，旧前置
+180.168.146.187 停服；新前置：第一套(仿真) 182.254.243.31:30011/30001
+（跟随交易时段）、7x24 40011/40001（16:00~次日09:00）。
+
+**openctp Python 绑定根治（patch 方案）**：
+- 根因（gdb+反汇编）：openctp_ctp SWIG 包装含
+  `static std::locale g_loc("zh_CN.GB18030")`，glibc 无此 locale 定义
+  （locales 包只到 GBK；LC_IDENTIFICATION codeset 校验无法满足）→
+  import 即 abort。试遍 locales/charmap/localedef/ICU/Py3.11/官方 so 无效。
+- 修复：二进制 patch `.so` 中 "zh_CN.GB18030" → "C"（等长 \0 填充），
+  脚本 `backend/scripts/ctp_probe/patch_gbk.sh`（Dockerfile build 阶段执行）。
+- 验证：patch 后 Python 绑定真实登录 SimNow 成功（py_login.py）。
+
+**CTP 已知问题（技术债）**：
+1. 中文字段乱码：patch 后 boost GBK→UTF8 退化为字节透传（品种名等中文乱码，
+   ID/数字字段不受影响）。根治需 openctp 上游修复或源码编译时替换 .i 中 locale 名。
+2. md+td 同时 import 的进程退出时可能 segfault（atexit 析构）；功能不受影响
+   （登录/行情/报单路径正常），verify_env 以输出判定容忍。
+3. 升级 openctp-ctp 版本必须重验 patch 匹配（字符串位置/内容可能变）。
+
+**环境固化（M2-c，保证容器重建不丢）**：
+- Dockerfile：locales + openctp-ctp==6.7.11.0 + patch + **全部第三方依赖**
+  （sqlalchemy/pandas/pyarrow/fastapi/pytest 等，版本对齐 pyproject）
+- startup.sh：仅做秒级 editable 注册（`pip3 install --no-deps -e .`）——
+  9p 挂载卷上 uv/pip 全量安装曾卡 10 分钟+，故依赖不进 startup
+- compose：build context 改 repo 根（Dockerfile COPY 脚本需要）+
+  repo 根 .dockerignore（排除 .git/data/__pycache__）
+- **重建流程**：`docker compose -f .devcontainer/docker-compose.devcontainer.yml
+  build app && up -d` → `docker exec devcontainer-app-1 bash
+  /workspace/backend/scripts/verify_env.sh`（5 项一键验证：CTP import /
+  alembic / pytest / SimNow 登录 / 回放影子链路）
+- 凭证在 .devcontainer/.env（gitignore）：SIMNOW_USER_ID/PASSWORD/APP_ID/
+  AUTH_CODE + CTP_BROKER_ID/MD_FRONT(40011)/TRADE_FRONT(40001)
 
 ## 开发环境：devcontainer（复刻 doc_process_studio 模式）
 
@@ -139,8 +176,9 @@ backend/src/futures_trading/
 4. 显式状态优于隐式假设——订单状态机 + 重启强制对账，无单例全局状态
 5. 可观测即默认——每个信号、每次风控拒绝全量落库
 
-## 下一步：M1（回测系统）
+## 下一步：M2-d（CTP 适配器真连）+ M3（前端）
 
-BacktestMarketData + BacktestBroker 事件驱动回测 + 历史数据导入（akshare）
-+ 两级报告（实例级/组合级）+ 参数扫描。领域层与 M0-a 的 BacktestBroker 对接，
-Strategy Engine 接正式回测循环。
+- M2-d：CtpMarketData/CtpTradeGateway 补 spi 回调真连（登录已验证，
+  剩订阅/报单/回报/对账）；影子 → SIM 切换；tick→bar 聚合接总线
+- M3：前端 dashboard（回测报告/曲线/持仓/信号）+ settings 页
+  （SimNow 凭证从 .env 迁入 system_secrets 加密存储，复刻 DPS 模式）

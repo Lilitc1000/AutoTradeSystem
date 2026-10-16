@@ -16,8 +16,8 @@
 services:
   app:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
     privileged: true
     depends_on:
       db:

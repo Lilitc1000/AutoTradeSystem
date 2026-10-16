@@ -21,5 +21,16 @@ if ! pgrep -x sshd > /dev/null 2>&1; then
 fi
 echo "[startup] sshd ready on :22 (host 2223)" >> "$LOG_DIR/startup.log"
 
+# editable 注册（M2-c）：镜像已含全部第三方依赖（Dockerfile pip 直装）；
+# 这里只做秒级注册（--no-deps，避免 9p 挂载上的慢构建曾卡 10 分钟+）。
+# openctp-ctp 由 Dockerfile build 阶段安装+patch（镜像内含，此处不装——
+# 避免 pip 重装覆盖 patch 过的 .so）。
+if ! python3 -c 'import futures_trading' > /dev/null 2>&1; then
+    echo "[startup] editable 注册 futures_trading ..." >> "$LOG_DIR/startup.log"
+    (cd /workspace/backend && pip3 install --no-deps -q --break-system-packages -e .) \
+        >> "$LOG_DIR/deps.log" 2>&1 \
+        || echo "[startup] editable 注册失败（不影响容器存活，跑 verify_env.sh 排查）" >> "$LOG_DIR/startup.log"
+fi
+
 # 保持前台（PID 1 不得退出）
 exec tail -f /dev/null
