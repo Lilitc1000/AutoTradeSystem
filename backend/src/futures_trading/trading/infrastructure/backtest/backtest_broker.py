@@ -11,11 +11,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from decimal import Decimal
 
 from ....common.errors import ValidationError
 from ....common.types import ZERO, Money, Price, Quantity
 from ...application.dtos import Bar, OrderCommand
+from ...domain.model.instrument import Instrument
 from ...domain.model.order import Offset, Order, OrderStatus, PriceType
 from ...domain.model.position import Fill, Position
 from ...domain.model.signal import Direction
@@ -29,7 +31,7 @@ class BacktestBroker:
         self,
         initial_capital: Money,
         slippage: SlippageModel | None = None,
-        instruments: dict[str, object] | None = None,
+        instruments: Mapping[str, Instrument] | None = None,
     ) -> None:
         """
         instruments: contract -> Instrument 映射（乘数查询用）。

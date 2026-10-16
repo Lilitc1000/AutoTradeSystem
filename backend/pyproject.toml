@@ -26,6 +26,10 @@ dev = [
   "akshare>=1.14",
 ]
 
+[project.optional-dependencies]
+# M2-b CTP 联调专用（Linux C++ 扩展，Windows 开发机不装）
+ctp = ["openctp-ctp>=6.7"]
+
 [build-system]
 requires = ["setuptools>=80"]
 build-backend = "setuptools.build_meta"

@@ -1,4 +1,4 @@
-"""用例值对象：行情 Bar 与下单指令 OrderCommand。"""
+"""用例值对象：行情 Bar/Tick 与下单指令 OrderCommand。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,19 @@ from decimal import Decimal
 from ...common.types import ZERO, Price, Quantity
 from ..domain.model.order import Offset, PriceType, make_idempotency_key
 from ..domain.model.signal import Direction
+
+
+@dataclass(frozen=True)
+class Tick:
+    """一笔行情快照（CTP DepthMarketData / 回放源）。"""
+
+    symbol: str
+    ts: datetime
+    last_price: Price
+    volume: Quantity = Quantity(ZERO)
+    open_interest: Quantity = Quantity(ZERO)
+    bid_price: Price | None = None
+    ask_price: Price | None = None
 
 
 @dataclass(frozen=True)

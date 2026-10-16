@@ -6,7 +6,7 @@
 - 用户说明书：`docs/user_manual.html`
 - 技术设计文档：`docs/design/technical_design.html`
 
-## 当前进度：M1 回测系统已完成（commit 见 git log）
+## 当前进度：M2-a 影子模式已完成（commit 见 git log）
 
 - **M0-a**：领域模型（五聚合根 + Signal）+ 领域服务（PositionSizer 四层取小 /
   RiskEngine 硬规则 fail-closed）+ 应用层四端口 + BacktestBroker 最小回测闭环。
@@ -14,14 +14,24 @@
   （ProcessBase：信号处理/优雅退出/Redis 心跳）+ api_dashboard /healthz。
 - **M1**：事件驱动回测引擎（BacktestClock/MarketData/Engine + SignalPipeline
   回测实盘共用）+ TrendATR 策略 + 两级指标（含 avg_loss_vs_budget 王牌指标）
-  + Parquet 数据层 + akshare 导入 + 参数扫描（≤2 参数）+ 回测 API
-  （jobs/scan/runs/reports，报告落 PG）。
+  + Parquet 数据层 + akshare 导入 + 参数扫描（≤2 参数）+ 回测 API。
+- **M2-a**：Redis 消息总线（md.bar/trade.order/signal.outcome）+ BarAggregator
+  （tick→bar）+ CTP 适配器骨架（mapping 纯函数全覆盖单测；真连待 M2-b）+
+  ReplayMarketData（Parquet 回放当实时行情）+ ShadowEngine（实盘链路无 IO，
+  影子成交复用 BacktestBroker）+ strategy_core/md_gateway 接线。
 
-**质量数据**：145 项测试通过（含真实 PG 集成）；ruff + mypy(strict) 零问题。
-**真实数据首测结论**（12 年 rb 日线）：默认参数无效（-0.21%），9 组参数扫描
-无一为正——单品种日线双均线样本不足（0-12 笔/12年），且日线止损跳空滑点
-使 avg_loss_vs_budget 达 518%（该指标正确暴露了日线频率的固有限制，
-反证 15 分钟策略方向的正确性：分钟级止损滑点小得多）。
+**影子模式端到端已验证**（12 年 rb 日线回放 → 总线 → strategy_core：
+120 个信号，EXECUTED/REJECTED(R07) 正常，权益 1,000,000→1,000,884）。
+
+**M2-b 前置清单**（用户提供 SimNow 账号后）：
+1. 注册 SimNow（simnow.com.cn，手机号当天生效）→ 账号/密码配 .devcontainer/.env
+2. 容器装 `pip install openctp-ctp`（PyPI 包名；曾误试 `openctp` 不存在）
+3. **CTP locale 问题**：openctp_ctp import 时 glibc C++ facet abort
+   （locale::facet::_S_create_c_locale name not valid）。Dockerfile 已声明
+   locales + LANG=en_US.UTF-8；当前容器已热修（apt locales + locale-gen）。
+   联调时若仍 abort 需专项排查（localedef / glibc 版本）
+4. CTP 适配器补真连：CreateFtdcMdApi/TraderApi + spi 回调 + 登录/订阅/报单
+5. 影子 → SIM 切换：OrderPort 从 BacktestBroker 切 CtpTradeGateway
 
 ## 开发环境：devcontainer（复刻 doc_process_studio 模式）
 
@@ -90,6 +100,13 @@ ATS="C:/Users/autotoll/.workbuddy/bin/ats.py"   # 主副本；repo scripts/ats.p
    查询必须 eager load；集合用 selectinload（joinedload 一对多要求 .unique()）。
 9. **容器内 redis-cli/psql**：服务在独立容器，要显式 `-h redis` / `-h db`；
    psql 不认 `postgresql+asyncpg://` 前缀，用 `${DATABASE_URL/+asyncpg/}` 转换。
+10. **openctp 安装**：PyPI 包名是 `openctp-ctp`（`openctp` 不存在），模块名
+    `openctp_ctp`；import 需容器 locale（见 M2-b 前置清单第 3 条）。
+11. **函数内相对 import 逃过静态检查**：mypy/import 诊断只覆盖模块级，
+    进程启动才炸（strategy_core 曾中招）——相对 import 一律写模块顶部。
+12. **ats.py exec + 后台进程**：`setsid ... &` 与前台命令混排时 SSH channel
+    读取会挂起（bash 非交互等 job）——起进程与跑任务分两次 exec；
+    后台进程必须 `< /dev/null > log 2>&1` 全重定向。
 
 ## 开发
 
