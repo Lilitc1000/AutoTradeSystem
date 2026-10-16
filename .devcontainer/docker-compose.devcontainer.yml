@@ -34,7 +34,9 @@ services:
     ports:
       - "2223:22"
       - "8000:8000"
-    command: bash -lc '/workspace/.devcontainer/startup.sh'
+    # 数组形式：bash 把脚本当文件参数读取执行，不依赖执行位
+    # （SFTP put 会丢 mode，bash -lc 'script' 的 execve 语义则必须 755）
+    command: ["/bin/bash", "/workspace/.devcontainer/startup.sh"]
 
   db:
     image: postgres:16-alpine
