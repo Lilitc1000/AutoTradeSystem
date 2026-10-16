@@ -48,9 +48,12 @@ class ShadowEngine:
         config: ShadowConfig,
         instruments: dict[str, Instrument],
         order_port: OrderPort | None = None,
+        external_fills: bool = False,
     ) -> None:
+        """external_fills=True 为 SIM 模式：成交由柜台异步回报喂入（非同步撮合）。"""
         self.config = config
         self.instruments = instruments
+        self.external_fills = external_fills
         self.history: dict[str, list[Bar]] = {}
         self.generator: SignalGenerator = make_generator(config.strategy_type.value, config.params)
         self.risk_engine = RiskEngine()
@@ -101,15 +104,25 @@ class ShadowEngine:
             results.append(outcome)
             self.outcomes.append(outcome)
 
-        # 2. 影子撮合：当前 bar 即"市场”，挂单按它成交
-        filled = self.broker.on_bar(bar)
-        self._apply_fills(filled)
+        # 2. 成交：影子模式同步撮合；SIM 模式由柜台回报异步喂入（见 apply_fill）
+        if not self.external_fills:
+            filled = self.broker.on_bar(bar)
+            self._apply_fills(filled)
 
-        # 3. 记账
-        last_prices = {s: bars[-1].close for s, bars in self.history.items()}
-        self.portfolio.equity = self.broker.equity(last_prices)
-        self.portfolio.update_peak()
+            # 3. 记账（影子：虚拟账户权益）
+            last_prices = {s: bars[-1].close for s, bars in self.history.items()}
+            self.portfolio.equity = self.broker.equity(last_prices)
+            self.portfolio.update_peak()
         return results
+
+    def apply_fill(self, order: object) -> None:
+        """SIM 模式：应用一笔柜台成交回报（OnRtnTrade 后的 Order）。"""
+        self._apply_fills([order])
+
+    def set_equity(self, equity: Decimal) -> None:
+        """SIM 模式：用柜台资金快照更新组合权益。"""
+        self.portfolio.equity = Money(Decimal(equity))
+        self.portfolio.update_peak()
 
     def _apply_fills(self, filled: list) -> None:
         for order in filled:

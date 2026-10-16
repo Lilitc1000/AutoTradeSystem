@@ -62,14 +62,35 @@ async def _heartbeat() -> None:
         await client.aclose()
 
 
-async def run_shadow(symbols: list[str], config: ShadowConfig) -> None:
+async def run_shadow(symbols: list[str], config: ShadowConfig, mode: str = "shadow") -> None:
+    """影子模式（虚拟成交）或 SIM 模式（SimNow 真实成交）。
+
+    SIM 模式差异：
+    - order_port = CtpTradeGateway（真实报单，成交由柜台异步回报）
+    - engine.external_fills=True：on_bar 不做同步撮合
+    - 订阅 trade.fill：把柜台成交应用到持仓（apply_fill）
+    """
     instruments = {s: get_instrument(s) for s in symbols}
-    engine = ShadowEngine(config, instruments)
+    gateway = None
+    account = None
+    if mode == "sim":
+        from ..trading.infrastructure.ctp.adapters import (  # noqa: PLC0415 - 懒加载（Linux C++ 扩展）
+            CtpAccount,
+            CtpConfig,
+            CtpTradeGateway,
+        )
+
+        gateway = CtpTradeGateway(CtpConfig.from_settings(), MessageBus(), instruments)
+        await gateway.start()
+        account = CtpAccount(gateway)
+
+    engine = ShadowEngine(config, instruments, order_port=gateway, external_fills=(mode == "sim"))
     bus = MessageBus()
-    print(f"[strategy_core] 影子实例 {config.instance_id} 就绪，订阅 {len(symbols)} 个品种", flush=True)
+    print(f"[strategy_core] {mode} 实例 {config.instance_id} 就绪，订阅 {len(symbols)} 个品种", flush=True)
     bar_count = 0
     outcome_count = 0
     heartbeat_task = asyncio.create_task(_heartbeat())
+    fill_task = asyncio.create_task(_consume_fills(engine, gateway, bus)) if mode == "sim" else None
     try:
         async for _channel, payload in bus.subscribe(*[f"md.bar.{s}" for s in symbols]):
             bar = _payload_to_bar(payload)
@@ -95,6 +116,10 @@ async def run_shadow(symbols: list[str], config: ShadowConfig) -> None:
                     f"lots={outcome.lots} {outcome.reason or ''}",
                     flush=True,
                 )
+            # SIM 模式：按柜台资金快照更新权益（持仓由 fill 消费协程应用）
+            if mode == "sim" and account is not None and bar_count % 10 == 0:
+                engine.set_equity(Decimal(account.balance()))
+
             if bar_count % 50 == 0:
                 print(
                     f"[strategy_core] 已处理 {bar_count} 根 bar，信号 {outcome_count} 个，"
@@ -103,13 +128,29 @@ async def run_shadow(symbols: list[str], config: ShadowConfig) -> None:
                 )
     finally:
         heartbeat_task.cancel()
+        if fill_task is not None:
+            fill_task.cancel()
+        if gateway is not None:
+            await gateway.stop()
         await bus.close()
 
 
+async def _consume_fills(engine: ShadowEngine, gateway: object, bus: MessageBus) -> None:
+    """SIM 模式：消费 trade.fill（柜台成交回报）→ 应用到持仓。"""
+    async for _channel, payload in bus.subscribe("trade.fill"):
+        order_id = str(payload.get("order_id", ""))
+        query = getattr(gateway, "query", None)
+        order = query(order_id) if callable(query) else None
+        if order is not None:
+            engine.apply_fill(order)
+            print(f"[strategy_core] 成交应用 {order_id} {order.status}", flush=True)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="策略引擎（M2-a 影子模式）")
+    parser = argparse.ArgumentParser(description="策略引擎（shadow 影子 / sim SimNow 真实成交）")
     parser.add_argument("--symbols", default="rb")
     parser.add_argument("--instance-id", default="shadow-1")
+    parser.add_argument("--mode", default="shadow", choices=["shadow", "sim"])
     parser.add_argument("--risk-per-trade-pct", default="0.01")
     parser.add_argument("--params", default="{}", help='JSON，如 {"fast_window":5,"slow_window":30}')
     args = parser.parse_args()
@@ -119,7 +160,7 @@ def main() -> None:
         params=json.loads(args.params),
         risk_per_trade_pct=Decimal(args.risk_per_trade_pct),
     )
-    asyncio.run(run_shadow([s.strip() for s in args.symbols.split(",") if s.strip()], config))
+    asyncio.run(run_shadow([s.strip() for s in args.symbols.split(",") if s.strip()], config, args.mode))
 
 
 if __name__ == "__main__":
