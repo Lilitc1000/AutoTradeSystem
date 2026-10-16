@@ -35,7 +35,22 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
-# openctp CTP 绑定 + 关键 patch（版本锁定 6.7.11.0）：
+# 依赖安装（pyproject.toml 是唯一真相源，uv + 国内源）：
+# - uv 直接读 pyproject.toml 的 dependencies + optional-dependencies +
+#   dependency-groups（--extra ctp 装 CTP 绑定，--group dev 装测试/工具链）
+# - 改依赖只改 pyproject.toml 一处，rebuild 层缓存只失效本层（改代码不触发）
+# - 为什么在镜像装而非容器启动装：/workspace 是 9p 挂载卷，容器内 uv 全量
+#   安装曾卡 10 分钟+；镜像内是本地层，uv 快且可复现
+# - 版本策略：范围版本（pyproject >= 约束），uv 解析安装；开发环境单源足够，
+#   未来生产部署再引入 uv.lock 严格锁定（见 PROJECT.md）
+COPY backend/pyproject.toml /tmp/pyproject.toml
+RUN cd /tmp \
+    && uv pip install --system \
+        --index-url https://mirrors.aliyun.com/pypi/simple/ \
+        -r pyproject.toml --extra ctp --group dev \
+    && rm /tmp/pyproject.toml
+
+# openctp GB18030 patch（依赖装完后执行；版本锁定见 requirements.txt）：
 # 根因（gdb + 反汇编定位）：openctp_ctp 的 SWIG 包装含
 #   static std::locale g_loc("zh_CN.GB18030")
 # glibc 无 zh_CN.GB18030 locale 定义（locales 包只到 GBK，且 LC_IDENTIFICATION
@@ -45,18 +60,7 @@ ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 # 脚本单源真理：backend/scripts/ctp_probe/patch_gbk.sh（容器内热修也用同一脚本）。
 # 升级 openctp-ctp 版本时必须重验 patch 是否仍匹配！
 COPY backend/scripts/ctp_probe/patch_gbk.sh /tmp/patch_gbk.sh
-RUN pip3 install --no-cache-dir "openctp-ctp==6.7.11.0" \
-    && bash /tmp/patch_gbk.sh \
+RUN bash /tmp/patch_gbk.sh \
     && rm /tmp/patch_gbk.sh
-
-# 项目依赖进镜像（M2-c：editable 注册放 startup.sh——/workspace 是 9p
-# 挂载卷，uv/pip 在其上构建 editable 元数据极慢，曾卡 10 分钟+）。
-# 装非项目依赖本体；版本与 backend/pyproject.toml 对齐，改依赖时同步更新。
-RUN pip3 install --no-cache-dir \
-    "sqlalchemy[asyncio]>=2.0" "asyncpg>=0.29" "alembic>=1.13" \
-    "pydantic-settings>=2.3" "fastapi>=0.115" "uvicorn[standard]>=0.30" \
-    "redis>=5.2" "pandas>=2.2" "pyarrow>=15.0" \
-    "pytest>=8.3.0" "pytest-cov>=5.0.0" "pytest-asyncio>=0.24" \
-    "ruff>=0.6.0" "mypy>=1.11.0" "akshare>=1.14"
 
 EXPOSE 22

@@ -57,10 +57,15 @@ TradingDay=20261015）。**迁址根因**：SimNow 2025-06-19 迁址，旧前置
 3. 升级 openctp-ctp 版本必须重验 patch 匹配（字符串位置/内容可能变）。
 
 **环境固化（M2-c，保证容器重建不丢）**：
-- Dockerfile：locales + openctp-ctp==6.7.11.0 + patch + **全部第三方依赖**
-  （sqlalchemy/pandas/pyarrow/fastapi/pytest 等，版本对齐 pyproject）
+- Dockerfile：locales + **uv 安装**（`uv pip install --system -i 阿里云源
+  -r pyproject.toml --extra ctp --group dev`，实测 61 秒装完 70 包，
+  pip 同量 12.5 分钟）+ openctp patch
+- pyproject.toml 是依赖唯一真相源（PEP 621 + PEP 735）；**改依赖流程**：
+  改 pyproject.toml → rebuild（层缓存只失效依赖层，改代码不触发）
+- 版本策略：范围版本（>= 约束）uv 解析——开发环境单源足够；
+  未来生产部署再引入 uv.lock 严格锁定（生成：`uv lock`）
 - startup.sh：仅做秒级 editable 注册（`pip3 install --no-deps -e .`）——
-  9p 挂载卷上 uv/pip 全量安装曾卡 10 分钟+，故依赖不进 startup
+  9p 挂载卷上容器内全量安装曾卡 10 分钟+，故依赖不进 startup
 - compose：build context 改 repo 根（Dockerfile COPY 脚本需要）+
   repo 根 .dockerignore（排除 .git/data/__pycache__）
 - **重建流程**：`docker compose -f .devcontainer/docker-compose.devcontainer.yml
