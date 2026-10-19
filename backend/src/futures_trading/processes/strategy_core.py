@@ -51,12 +51,16 @@ def _payload_to_bar(payload: dict) -> Bar:
 
 
 async def _heartbeat() -> None:
-    """Redis 心跳（healthz 监控用，与 ProcessBase 同款 key/TTL）。"""
+    """Redis 心跳（healthz 监控用，与 ProcessBase 同款 key/TTL）+ 内存采样。"""
     client = redis.from_url(settings.redis_url, decode_responses=True)
     key = f"{settings.redis_key_prefix}:proc:strategy_core:hb"
+    mem_key = f"{settings.redis_key_prefix}:proc:strategy_core:mem"
     try:
         while True:
             await client.set(key, datetime.now(UTC).isoformat(), ex=15)
+            rss = ProcessBase._rss_kb()
+            if rss is not None:
+                await client.set(mem_key, rss, ex=15)
             await asyncio.sleep(5)
     finally:
         await client.aclose()

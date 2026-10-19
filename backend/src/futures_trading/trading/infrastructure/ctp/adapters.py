@@ -197,13 +197,21 @@ class CtpMarketData(MarketDataPort):
         self._api.Init()
         await self.run()
 
-    async def run(self) -> None:
-        """asyncio 部分：等登录就绪 + 起消费协程 + 常驻（api 已由 create() 建好）。"""
+    async def run(self, max_runtime_seconds: int = 0) -> None:
+        """asyncio 部分：等登录就绪 + 起消费协程 + 常驻（api 已由 create() 建好）。
+
+        max_runtime_seconds>0：到时主动退出（禁 GC 进程的内存重置机制——
+        由守护进程重启，规避循环引用垃圾的长跑累积；0=不限）。
+        """
         self._loop = asyncio.get_running_loop()
         await asyncio.to_thread(self._ready.wait, 20)
         self._consumer = asyncio.create_task(self._consume())
+        started = asyncio.get_running_loop().time()
         while True:
             await asyncio.sleep(1)
+            if max_runtime_seconds > 0 and asyncio.get_running_loop().time() - started >= max_runtime_seconds:
+                logger.info("到达 max_runtime=%ds，主动退出（守护将重启，重置内存）", max_runtime_seconds)
+                return
 
     async def stop(self) -> None:
         if self._consumer is not None:

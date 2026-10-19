@@ -74,6 +74,18 @@ class TestShadowEngine:
             engine.on_bar(bar)
         assert len(engine.history["rb"]) == 10
 
+    def test_history_window_capped(self) -> None:
+        """历史窗口有上限（实盘 7x24 常驻防无限增长/内存泄漏）。"""
+        from futures_trading.trading.application.shadow import HISTORY_LIMIT
+
+        engine = make_engine()
+        bars = synthesize(count=HISTORY_LIMIT + 50)
+        for bar in bars:
+            engine.on_bar(bar)
+        assert len(engine.history["rb"]) == HISTORY_LIMIT
+        # 保留的是最近部分（最后一根在窗口内）
+        assert engine.history["rb"][-1].ts == bars[-1].ts
+
     def test_no_lookahead_signal_uses_only_past(self) -> None:
         """信号只能看到当前及以前的 bar（history 先 append 再产信号）。"""
         engine = make_engine()

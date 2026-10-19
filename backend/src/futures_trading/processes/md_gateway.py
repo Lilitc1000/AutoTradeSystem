@@ -42,11 +42,11 @@ def _symbol_of(contract: str) -> str:
     return "".join(ch for ch in contract if not ch.isdigit())
 
 
-async def _run_ctp(md: CtpMarketData) -> None:
+async def _run_ctp(md: CtpMarketData, max_runtime_minutes: int = 0) -> None:
     """asyncio 部分：运行已创建好的 CtpMarketData（create() 须在主帧先调用）。"""
-    logger.info("CtpMarketData 运行中")
+    logger.info("CtpMarketData 运行中（max_runtime=%d 分钟，0=不限）", max_runtime_minutes)
     try:
-        await md.run()
+        await md.run(max_runtime_seconds=max_runtime_minutes * 60)
     finally:
         logger.info("CTP 源退出，stop() ...")
         await md.stop()
@@ -64,6 +64,8 @@ def main() -> None:
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD（含）")
     parser.add_argument("--end", default=None, help="截止日期 YYYY-MM-DD（含）")
+    parser.add_argument("--max-runtime-minutes", type=int, default=120,
+                        help="ctp 源最大运行分钟数，到时主动退出（守护重启重置内存；0=不限）")
     args = parser.parse_args()
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -79,7 +81,7 @@ def main() -> None:
             interval_minutes=_INTERVAL_MINUTES.get(args.interval, 1),
         )
         md.subscribe(symbols)
-        asyncio.run(_run_ctp(md))
+        asyncio.run(_run_ctp(md, max_runtime_minutes=args.max_runtime_minutes))
         return
 
     # replay 源懒加载（pandas 链，见模块头说明）

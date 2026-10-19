@@ -24,6 +24,10 @@ from ..domain.service.risk_engine import RiskEngine
 from ..infrastructure.backtest.backtest_broker import BacktestBroker
 from ..infrastructure.backtest.slippage_model import SlippageModel
 
+# bar 历史窗口上限（防无限增长——实盘 7x24 常驻，ATR 只用最近 20 根、
+# 策略慢线默认 30 根，500 根有 16 倍余量；超出即从头部淘汰）
+HISTORY_LIMIT = 500
+
 
 @dataclass(frozen=True)
 class ShadowConfig:
@@ -85,7 +89,10 @@ class ShadowEngine:
 
     def on_bar(self, bar: Bar) -> list[SignalOutcome]:
         """喂入一根 bar（来自 CTP 或回放）；返回本根 bar 产生的信号处理结果。"""
-        self.history.setdefault(bar.symbol, []).append(bar)
+        bars = self.history.setdefault(bar.symbol, [])
+        bars.append(bar)
+        if len(bars) > HISTORY_LIMIT:
+            del bars[:-HISTORY_LIMIT]  # 淘汰最旧，保留最近 HISTORY_LIMIT 根
 
         # 1. 策略信号（只看当前及以前——防未来函数同样适用于实盘）
         signals = self.generator.on_bar(self.history, self.instance, bar.ts)
