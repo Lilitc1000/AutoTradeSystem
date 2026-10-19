@@ -303,6 +303,14 @@ class CtpMarketData(MarketDataPort):
             payload = await self._queue.get()
             if payload is None:
                 return
+            logger.info(
+                "bar 闭合: %s %s ts=%s close=%s vol=%s",
+                payload.get("contract"),
+                f"{payload.get('interval_minutes')}m",
+                payload.get("ts"),
+                payload.get("close"),
+                payload.get("volume"),
+            )
             await self.bus.publish_bar(payload)
 
 

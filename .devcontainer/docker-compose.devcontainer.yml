@@ -38,6 +38,59 @@ services:
     # （SFTP put 会丢 mode，bash -lc 'script' 的 execve 语义则必须 755）
     command: ["/bin/bash", "/workspace/.devcontainer/startup.sh"]
 
+  # ---- M2-d 实盘链路 workers（CTP 独立进程，compose 守护）----
+  # 与 app 同镜像同挂载；command 为数组形式（execve 直传，无 shell 引号问题）。
+  # -c 入口 = gc.disable + runpy（openctp SWIG segfault 规避，实证稳定，
+  # 见 backend/scripts/ctp_probe/run_chain.sh 注释）。
+  # 日志：docker compose -f .devcontainer/docker-compose.devcontainer.yml logs -f md_gateway
+
+  md_gateway:
+    image: devcontainer-app:latest
+    depends_on:
+      app:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      - PYTHONPATH=src
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+    working_dir: /workspace/backend
+    volumes:
+      - ..:/workspace:delegated
+    command:
+      - "python3"
+      - "-c"
+      - |
+        import gc, sys, runpy
+        gc.disable()
+        sys.argv = ["md_gateway", "--source", "ctp", "--symbols", "rb2701", "--interval", "min1"]
+        runpy.run_module("futures_trading.processes.md_gateway", run_name="__main__")
+
+  strategy_core:
+    image: devcontainer-app:latest
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      - PYTHONPATH=src
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+    working_dir: /workspace/backend
+    volumes:
+      - ..:/workspace:delegated
+    command:
+      - "python3"
+      - "-u"
+      - "-m"
+      - "futures_trading.processes.strategy_core"
+      - "--symbols"
+      - "rb"
+      - "--params"
+      - "{}"
+
   db:
     image: postgres:16-alpine
     restart: always
