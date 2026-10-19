@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# 报单探针批量跑（容器内）：绕开外层 shell 引号地狱（Git Bash + wsl + docker exec
-# 三层嵌套引号已坑多次）。用法：docker exec ... bash run_order_test.sh [次数]
+# 报单探针批量跑（容器内）：绕开外层 shell 引号地狱。
+# 用法：bash run_order_test.sh [次数=3] [前置=tcp://182.254.243.31:30001] [合约=rb2701] [价格=2950]
+#   价格远离市价=挂住不成交（安全）；贴近/高于市价=立即成交（验证 OnRtnTrade）
 # 入口用 python3 -c "gc.disable(); runpy" ——M2-d 实证的 SWIG 稳定入口
-# （普通脚本入口在 Linux 上 30-60% 崩，-c 入口 3/3 稳）。
+# （普通脚本入口在 Linux 上 30-60% 崩，-c 入口显著降低；批量重试兜底）。
 set -u
 
 RUNS="${1:-3}"
-CONTRACT="${2:-rb2701}"
-PRICE="${3:-2950}"
+FRONT="${2:-tcp://182.254.243.31:30001}"
+CONTRACT="${3:-rb2701}"
+PRICE="${4:-2950}"
 cd /tmp || exit 1
 
 for i in $(seq 1 "$RUNS"); do
     rm -rf flow_td_probe
-    echo "=== run $i/$RUNS ==="
-    python3 -c "
+    echo "=== run $i/$RUNS front=$FRONT contract=$CONTRACT price=$PRICE ==="
+    ORDER_PROBE_FRONT="$FRONT" python3 -c "
 import gc, sys
 gc.disable()  # SWIG + GC 竞争（M2-d 实锤根因）
 sys.argv = ['py_order_probe.py', '$CONTRACT', '$PRICE']
