@@ -69,6 +69,7 @@ def main() -> int:
     os.makedirs(FLOW_DIR, exist_ok=True)
 
     from openctp_ctp.thosttraderapi import (
+        CThostFtdcQryOrderField,
         CThostFtdcReqAuthenticateField,
         CThostFtdcReqUserLoginField,
         CThostFtdcInputOrderActionField,
@@ -86,6 +87,7 @@ def main() -> int:
     state["login_field"] = CThostFtdcReqUserLoginField()
     state["order_field"] = CThostFtdcInputOrderField()
     state["action_field"] = CThostFtdcInputOrderActionField()
+    state["qry_field"] = CThostFtdcQryOrderField()
 
     class Impl(CThostFtdcTraderSpi):
         def OnFrontConnected(self) -> None:
@@ -165,6 +167,20 @@ def main() -> int:
             if pRspInfo:
                 print(f"[order-probe] 报单错误 {pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}", flush=True)
 
+        def OnRspOrderInsert(self, pInputOrder, pRspInfo, nRequestID, bIsLast) -> None:
+            if pRspInfo and pRspInfo.ErrorID != 0:
+                print(f"[order-probe] 发单被拒 {pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}", flush=True)
+            else:
+                print("[order-probe] 发单请求已被柜台接受", flush=True)
+
+        def OnRspQryOrder(self, pOrder, pRspInfo, nRequestID, bIsLast) -> None:
+            if pOrder:
+                print(
+                    f"[order-probe] 委托记录 Ref={pOrder.OrderRef} Status={pOrder.OrderStatus} "
+                    f"Submit={pOrder.OrderSubmitStatus} Msg={pOrder.StatusMsg}",
+                    flush=True,
+                )
+
         def OnRspOrderAction(self, pInputOrderAction, pRspInfo, nRequestID, bIsLast) -> None:
             if pRspInfo and pRspInfo.ErrorID != 0:
                 print(f"[order-probe] 撤单失败 {pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}", flush=True)
@@ -215,6 +231,14 @@ def main() -> int:
         if state["cancelled"]:
             break
         time.sleep(0.1)
+
+    # 查当日委托（StatusMsg 会写明订单被撤的原因——挖 a→5 的直通道）
+    print("[order-probe] 查询当日委托 ...", flush=True)
+    qry = state["qry_field"]
+    qry.BrokerID = BROKER
+    qry.InvestorID = USER
+    api.ReqQryOrder(qry, 5)
+    time.sleep(2)
 
     time.sleep(1)
     api.Release()
