@@ -6,8 +6,12 @@ RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debia
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
     && apt-get install -y --no-install-recommends \
        curl ca-certificates git build-essential openssh-server \
-       postgresql-client redis-tools jq \
+       postgresql-client redis-tools jq dmidecode \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+# dmidecode：CTP 交易登录读硬件指纹（看穿式监管）——WSL2 容器内 DMI 表
+# 不透传（/sys/firmware/dmi 不存在），交易登录在 WSL2 devcontainer 无法完成
+# （行情 md 登录不需要故正常）；真机/云部署环境必需，故固化进镜像。
+# 诊断记录：backend/scripts/ctp_probe/td_probe.cpp（C++ 对照探针）。
 
 # sshd + vscode 用户：ats.py 远程操作通道（复刻 doc_process_studio devbox 模式）
 RUN mkdir -p /var/run/sshd /home/vscode/.ssh \
