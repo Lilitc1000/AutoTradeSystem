@@ -1,20 +1,50 @@
 """报单探针（M2 SIM 报单链路验证）：认证 → 登录 → 限价挂单 → 回报 → 撤单。
 
-用法（容器内）：python3 scripts/ctp_probe/py_order_probe.py [合约] [价格]
+用法：python3 py_order_probe.py [合约] [价格]
   合约默认 rb2701；价格默认 2950（远离市价 ~3084，挂单不成交，可安全撤掉）
+  平台：Linux 容器 / Windows 宿主机均可（WSL2 容器缺 DMI 表无法交易登录，
+  Windows 宿主机有机器码——Windows 直跑是 WSL2 环境的报单验证路径）
 流程（官方 td_demo 同款）：
   OnFrontConnected → ReqAuthenticate → ReqUserLogin →
   ReqOrderInsert(限价) → OnRtnOrder/OnRtnTrade → ReqOrderAction(撤单)
-凭证从环境变量读取（exec 时 source .env）。
+凭证：环境变量优先；为空时从 .devcontainer/.env 加载（Windows 宿主机直跑用）。
+注意：Windows 宿主机跑本探针必须复制到本地路径（UNC 路径 + CTP so 会
+  segfault，实测：本地路径同代码完全正常）；午休/非交易时段交易登录会返回
+  "CTP:用户不活跃"（错误码4，vnpy 社区同款案例，交易时段即恢复）。
 """
 
 from __future__ import annotations
 
 import os
+import platform
 import sys
+import tempfile
 import time
 
 FRONT = "tcp://182.254.243.31:30001"  # 第一套交易前置
+
+
+def _load_env() -> None:
+    """环境变量缺凭证时，从 .devcontainer/.env 补全（仅 setdefault，不覆盖）。"""
+    if os.getenv("SIMNOW_USER_ID"):
+        return
+    for path in (
+        "/workspace/.devcontainer/.env",  # 容器内
+        "//wsl.localhost/Ubuntu/home/autotoll/repos/AutoTradeSystem/.devcontainer/.env",
+    ):
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, _, value = line.partition("=")
+                        os.environ.setdefault(key.strip(), value.strip())
+            print(f"[order-probe] 凭证已从 {path} 加载", flush=True)
+            return
+
+
+_load_env()
+
 BROKER = os.getenv("CTP_BROKER_ID", "9999")
 USER = os.getenv("SIMNOW_USER_ID", "")
 PASSWORD = os.getenv("SIMNOW_PASSWORD", "")
@@ -22,6 +52,10 @@ APP_ID = os.getenv("SIMNOW_APP_ID", "simnow_client_test")
 AUTH_CODE = os.getenv("SIMNOW_AUTH_CODE", "0000000000000000")
 CONTRACT = sys.argv[1] if len(sys.argv) > 1 else "rb2701"
 PRICE = sys.argv[2] if len(sys.argv) > 2 else "2950"
+# flow 目录：Linux 用相对路径（容器 cwd 本地层）；Windows 用系统临时目录
+FLOW_DIR = (
+    "./flow_td_probe/" if platform.system() == "Linux" else os.path.join(tempfile.gettempdir(), "flow_td_probe")
+)
 
 
 def main() -> int:
@@ -32,7 +66,7 @@ def main() -> int:
     import gc
 
     gc.disable()  # openctp SWIG + GC segfault 规避（见 adapters.create docstring）
-    os.makedirs("./flow_td_probe/", exist_ok=True)
+    os.makedirs(FLOW_DIR, exist_ok=True)
 
     from openctp_ctp.thosttraderapi import (
         CThostFtdcReqAuthenticateField,
@@ -43,7 +77,7 @@ def main() -> int:
         CThostFtdcTraderSpi,
     )
 
-    api = CThostFtdcTraderApi.CreateFtdcTraderApi("./flow_td_probe/")
+    api = CThostFtdcTraderApi.CreateFtdcTraderApi(FLOW_DIR)
     state = {"login": False, "order_ref": "", "submitted": False, "traded": False, "cancelled": False}
 
     class Impl(CThostFtdcTraderSpi):
@@ -130,7 +164,10 @@ def main() -> int:
             if pRspInfo:
                 print(f"[order-probe] OnRspError {pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}", flush=True)
 
-    api.RegisterSpi(Impl())
+    # spi 必须持有引用：inline Impl() 会被 GC，SWIG director 回调到已毁对象
+    # （Windows 实测 AttributeError / Linux 实测堆损坏——M2-d 同款坑）
+    spi = Impl()
+    api.RegisterSpi(spi)
     api.RegisterFront(FRONT)
     api.SubscribePrivateTopic(2)
     api.SubscribePublicTopic(2)
