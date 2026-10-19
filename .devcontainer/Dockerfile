@@ -6,12 +6,29 @@ RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debia
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
     && apt-get install -y --no-install-recommends \
        curl ca-certificates git build-essential openssh-server \
-       postgresql-client redis-tools jq dmidecode \
+       postgresql-client redis-tools jq dmidecode lshw \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
-# dmidecode：CTP 交易登录读硬件指纹（看穿式监管）——WSL2 容器内 DMI 表
-# 不透传（/sys/firmware/dmi 不存在），交易登录在 WSL2 devcontainer 无法完成
-# （行情 md 登录不需要故正常）；真机/云部署环境必需，故固化进镜像。
+# dmidecode/lshw：CTP 交易登录采集硬件指纹（看穿式监管终端识别，so 内部
+# exec 这两个命令）。WSL2 容器内 DMI 表不透传（/sys/firmware/dmi 不存在），
+# 交易登录在 WSL2 devcontainer 无法完成（行情 md 登录不需要故正常）；
+# 真机/云部署环境必需，故固化进镜像。
 # 诊断记录：backend/scripts/ctp_probe/td_probe.cpp（C++ 对照探针）。
+# WSL2 绕行：下方 fake dmidecode（CTP_FAKE_DMIDECODE，默认开发镜像启用）。
+
+# 假 dmidecode（仅测试镜像）：WSL2 无 DMI 表，CTP so exec dmidecode 拿不到
+# 机器码 → 认证阶段失败。fake 返回固定测试 UUID（= 开发机 Windows 宿主机
+# 真实 UUID，与 Windows 宿主机验证路径一致）。SimNow 机器码只记录不校验，
+# 仅限仿真测试；真生产用真机真 dmidecode（看穿式监管红线，不碰）。
+# 生产构建：--build-arg CTP_FAKE_DMIDECODE=0 关闭。
+ARG CTP_FAKE_DMIDECODE=1
+COPY backend/scripts/ctp_probe/fake_dmidecode.sh /tmp/fake_dmidecode.sh
+RUN if [ "$CTP_FAKE_DMIDECODE" = "1" ]; then \
+        install -m 755 /tmp/fake_dmidecode.sh /usr/local/bin/dmidecode; \
+        echo "fake dmidecode installed (test image)"; \
+    else \
+        echo "fake dmidecode skipped (production build)"; \
+    fi \
+    && rm /tmp/fake_dmidecode.sh
 
 # sshd + vscode 用户：ats.py 远程操作通道（复刻 doc_process_studio devbox 模式）
 RUN mkdir -p /var/run/sshd /home/vscode/.ssh \

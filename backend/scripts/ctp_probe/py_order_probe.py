@@ -79,11 +79,18 @@ def main() -> int:
 
     api = CThostFtdcTraderApi.CreateFtdcTraderApi(FLOW_DIR)
     state = {"login": False, "order_ref": "", "submitted": False, "traded": False, "cancelled": False}
+    # SWIG field 对象全部预创建（主线程）：faulthandler 实证回调线程内构造
+    # （OnRspAuthenticate → CThostFtdcReqUserLoginField）segfault——与
+    # CreateFtdcMdApi 的 GC/线程敏感同源。回调里只赋值+调用。
+    state["auth_field"] = CThostFtdcReqAuthenticateField()
+    state["login_field"] = CThostFtdcReqUserLoginField()
+    state["order_field"] = CThostFtdcInputOrderField()
+    state["action_field"] = CThostFtdcInputOrderActionField()
 
     class Impl(CThostFtdcTraderSpi):
         def OnFrontConnected(self) -> None:
             print("[order-probe] 前置连接成功", flush=True)
-            auth = CThostFtdcReqAuthenticateField()
+            auth = state["auth_field"]  # 预创建（回调线程构造 SWIG 对象会崩）
             auth.BrokerID = BROKER
             auth.UserID = USER
             auth.AppID = APP_ID
@@ -95,7 +102,7 @@ def main() -> int:
                 print(f"[order-probe] 认证失败 {pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}", flush=True)
                 return
             print("[order-probe] 认证成功（看穿式）", flush=True)
-            f = CThostFtdcReqUserLoginField()
+            f = state["login_field"]  # 预创建
             f.BrokerID = BROKER
             f.UserID = USER
             f.Password = PASSWORD
@@ -108,7 +115,7 @@ def main() -> int:
             state["login"] = True
             print(f"[order-probe] 登录成功 TradingDay={pRspUserLogin.TradingDay}", flush=True)
             # 限价开多 1 手（价格远离市价，不会成交）
-            order = CThostFtdcInputOrderField()
+            order = state["order_field"]  # 预创建
             order.BrokerID = BROKER
             order.InvestorID = USER
             order.UserID = USER
@@ -191,7 +198,7 @@ def main() -> int:
 
     # 撤单（无论是否成交都撤——成交的单撤不掉但无妨）
     print("[order-probe] 撤单 ...", flush=True)
-    action = CThostFtdcInputOrderActionField()
+    action = state["action_field"]  # 预创建
     action.BrokerID = BROKER
     action.InvestorID = USER
     action.UserID = USER
