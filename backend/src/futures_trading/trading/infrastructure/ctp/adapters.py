@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections.abc import Sequence
 from decimal import Decimal
@@ -28,6 +29,8 @@ from ...domain.model.instrument import Instrument
 from ...domain.model.order import Order, OrderStatus, PriceType
 from ..bar_aggregator import BarAggregator
 from . import mapping
+
+logger = logging.getLogger(__name__)
 
 
 def _load_ctp() -> tuple[Any, Any]:
@@ -65,7 +68,10 @@ class CtpConfig:
         auth_code: str = "0000000000000000",
         md_front: str = "tcp://182.254.243.31:40011",
         trade_front: str = "tcp://182.254.243.31:40001",
+        flow_dir: str = "/tmp/futures_ctp",
     ) -> None:
+        """flow_dir：CTP 流文件目录（必须本地可写；容器 /workspace 是 9p 挂载，
+        CTP 在其上创建 CFlow 文件会失败，故默认放 /tmp）。"""
         self.broker_id = broker_id
         self.user_id = user_id
         self.password = password
@@ -73,6 +79,15 @@ class CtpConfig:
         self.auth_code = auth_code
         self.md_front = md_front
         self.trade_front = trade_front
+        self.flow_dir = flow_dir
+
+    def flow_path(self, name: str) -> str:
+        """确保 flow 子目录存在并返回（CTP CreateFtdcXxxApi 入参）。"""
+        import os  # noqa: PLC0415 - 仅此处需要
+
+        path = os.path.join(self.flow_dir, name)
+        os.makedirs(path, exist_ok=True)
+        return path
 
     @classmethod
     def from_settings(cls) -> CtpConfig:
@@ -110,8 +125,10 @@ class CtpMarketData(MarketDataPort):
         self.instruments = instruments or {}
         self.interval_minutes = interval_minutes
         self._aggregators: dict[str, BarAggregator] = {}
+        self._contract_to_symbol: dict[str, str] = {}
         self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._tick_count = 0
         self._api: Any = None
         self._subscribed: list[str] = []
         self._ready = threading.Event()
@@ -124,6 +141,8 @@ class CtpMarketData(MarketDataPort):
         if missing:
             raise ValueError(f"品种未注册: {missing}")
         self._subscribed = list(symbols)
+        # 合约 → 品种映射（CTP 订阅用合约代码，聚合/总线用品种）
+        self._contract_to_symbol = {c: inst.symbol for c, inst in self.instruments.items()}
         for s in symbols:
             self._aggregators.setdefault(s, BarAggregator(s, self.interval_minutes))
         # 已连接则立即订阅（未连接时由 start() 在登录后补订）
@@ -140,7 +159,7 @@ class CtpMarketData(MarketDataPort):
 
     async def start(self) -> None:
         md_api, _ = _load_ctp()
-        self._api = md_api.CThostFtdcMdApi.CreateFtdcMdApi("./flow_md/")
+        self._api = md_api.CThostFtdcMdApi.CreateFtdcMdApi(self.config.flow_path("flow_md"))
         self._spi = self._make_spi(md_api.CThostFtdcMdSpi)
         self._api.RegisterSpi(self._spi)
         self._api.RegisterFront(self.config.md_front)
@@ -200,17 +219,29 @@ class CtpMarketData(MarketDataPort):
 
             def OnRtnDepthMarketData(self, pDepthMarketData: Any) -> None:
                 payload = _field_to_dict(pDepthMarketData)
-                symbol = str(payload.get("InstrumentID", ""))
-                tick = mapping.ctp_depth_to_tick(payload, symbol=symbol)
-                if not symbol:
+                contract = str(payload.get("InstrumentID", ""))
+                if not contract:
                     return
-                agg = owner._aggregators.get(symbol)
+                # 聚合按合约（每合约独立 K 线）；发总线按品种（下游统一）
+                symbol = owner._contract_to_symbol.get(contract, contract)
+                tick = mapping.ctp_depth_to_tick(payload, symbol=contract)
+                owner._tick_count += 1
+                if owner._tick_count % 20 == 1:
+                    logger.info(
+                        "CTP tick 流: %s 第 %d 笔 last=%s",
+                        contract,
+                        owner._tick_count,
+                        payload.get("LastPrice"),
+                    )
+                agg = owner._aggregators.get(contract)
                 if agg is None:
-                    agg = BarAggregator(symbol, owner.interval_minutes)
-                    owner._aggregators[symbol] = agg
+                    agg = BarAggregator(contract, owner.interval_minutes)
+                    owner._aggregators[contract] = agg
                 bar = agg.on_tick(tick)
                 if bar is not None and owner._loop is not None:
-                    owner._loop.call_soon_threadsafe(owner._queue.put_nowait, _bar_payload(bar))
+                    owner._loop.call_soon_threadsafe(
+                        owner._queue.put_nowait, _bar_payload(bar, symbol=symbol)
+                    )
 
             def OnRspError(self, pRspInfo: Any, nRequestID: int, bIsLast: bool) -> None:
                 return
@@ -313,7 +344,7 @@ class CtpTradeGateway(OrderPort):
 
     async def start(self) -> None:
         _md, trade = _load_ctp()
-        self._api = trade.CThostFtdcTraderApi.CreateFtdcTraderApi("./flow_td/")
+        self._api = trade.CThostFtdcTraderApi.CreateFtdcTraderApi(self.config.flow_path("flow_td"))
         self._spi = self._make_spi(trade.CThostFtdcTraderSpi)
         self._api.RegisterSpi(self._spi)
         self._api.RegisterFront(self.config.trade_front)
@@ -559,9 +590,11 @@ def _field_to_dict(field: Any) -> dict[str, Any]:
     return {k: getattr(field, k) for k in dir(field) if not k.startswith("_") and not callable(getattr(field, k, None))}
 
 
-def _bar_payload(bar: Bar) -> dict[str, Any]:
+def _bar_payload(bar: Bar, symbol: str | None = None) -> dict[str, Any]:
+    """Bar → 总线 payload。symbol 覆盖为品种级（bar.symbol 是合约代码）。"""
     return {
-        "symbol": bar.symbol,
+        "symbol": symbol or bar.symbol,
+        "contract": bar.symbol,
         "interval_minutes": bar.interval_minutes,
         "ts": bar.ts.isoformat(),
         "open": str(bar.open),

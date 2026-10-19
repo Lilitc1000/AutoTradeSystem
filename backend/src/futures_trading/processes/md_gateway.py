@@ -12,12 +12,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 
 from ..common.instrument_registry import get_instrument
 from ..trading.infrastructure.ctp.adapters import CtpConfig, CtpMarketData
 from ..trading.infrastructure.messaging.bus import MessageBus
-from ..trading.infrastructure.replay.replay_market_data import replay
 from .base import ProcessBase
+
+logger = logging.getLogger(__name__)
+
+# 注意：replay 源（pandas/pyarrow）不在此处模块级 import——
+# openctp 的 C++ 扩展与 pandas 的 C 运行时同进程存在冲突（segfault），
+# ctp 源绝不加载 pandas；replay 源在 main() 内懒加载。
 
 _INTERVAL_MINUTES = {"min1": 1, "min5": 5, "min15": 15, "day": 1440}
 
@@ -38,6 +44,7 @@ def _symbol_of(contract: str) -> str:
 
 async def _run_ctp(contracts: list[str], interval: str) -> None:
     """CTP 实时行情：订阅 → 聚合 → 发总线（常驻，直到收到停止信号）。"""
+    logger.info("CTP 源启动: contracts=%s interval=%s", contracts, interval)
     # CTP 订阅用合约代码（rb2601），Instrument 注册表按品种（rb）索引
     instruments = {c: get_instrument(_symbol_of(c)) for c in contracts}
     bus = MessageBus()
@@ -45,16 +52,24 @@ async def _run_ctp(contracts: list[str], interval: str) -> None:
         CtpConfig.from_settings(), bus, instruments, interval_minutes=_INTERVAL_MINUTES.get(interval, 1)
     )
     md.subscribe(contracts)
+    logger.info("CtpMarketData start() ...")
     try:
         await md.start()
+        logger.info("CtpMarketData 就绪（ready=%s）", md._ready.is_set())
+        seconds = 0
         while True:
             await asyncio.sleep(1)
+            seconds += 1
+            if seconds % 10 == 0:
+                logger.info("运行中 %ds，tick 累计 %d", seconds, md._tick_count)
     finally:
+        logger.info("CTP 源退出，stop() ...")
         await md.stop()
         await bus.close()
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     parser = argparse.ArgumentParser(description="行情网关（replay 回放 / ctp 实时）")
     parser.add_argument("--source", default="replay", choices=["replay", "ctp"])
     parser.add_argument("--symbols", default="rb", help="逗号分隔品种（ctp 源用合约代码，如 rb2601）")
@@ -71,6 +86,9 @@ def main() -> None:
     if args.source == "ctp":
         asyncio.run(_run_ctp(symbols, args.interval))
         return
+
+    # replay 源懒加载（pandas 链，见模块头说明）
+    from ..trading.infrastructure.replay.replay_market_data import replay  # noqa: PLC0415
 
     for symbol in symbols:
         get_instrument(symbol)  # 注册表校验
