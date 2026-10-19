@@ -69,6 +69,7 @@ def main() -> int:
     os.makedirs(FLOW_DIR, exist_ok=True)
 
     from openctp_ctp.thosttraderapi import (
+        CThostFtdcSettlementInfoConfirmField,
         CThostFtdcQryOrderField,
         CThostFtdcReqAuthenticateField,
         CThostFtdcReqUserLoginField,
@@ -88,6 +89,7 @@ def main() -> int:
     state["order_field"] = CThostFtdcInputOrderField()
     state["action_field"] = CThostFtdcInputOrderActionField()
     state["qry_field"] = CThostFtdcQryOrderField()
+    state["confirm_field"] = CThostFtdcSettlementInfoConfirmField()
 
     class Impl(CThostFtdcTraderSpi):
         def OnFrontConnected(self) -> None:
@@ -116,6 +118,19 @@ def main() -> int:
                 return
             state["login"] = True
             print(f"[order-probe] 登录成功 TradingDay={pRspUserLogin.TradingDay}", flush=True)
+            # CTP 规范：交易日首次报单前必须确认结算单（快期/vnpy 自动做，
+            # 我们此前漏了——订单 a→5 被自动撤的第一嫌疑人）。
+            # 发单挪到 OnRspSettlementInfoConfirm。
+            confirm = state["confirm_field"]
+            confirm.BrokerID = BROKER
+            confirm.InvestorID = USER
+            api.ReqSettlementInfoConfirm(confirm, 5)
+
+        def OnRspSettlementInfoConfirm(self, pSettlementInfoConfirm, pRspInfo, nRequestID, bIsLast) -> None:
+            if pRspInfo and pRspInfo.ErrorID != 0:
+                print(f"[order-probe] 结算单确认失败 {pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}", flush=True)
+                return
+            print("[order-probe] 结算单已确认", flush=True)
             # 限价开多 1 手（价格略低于市价 ~3084，挂住不成交；远离市价会被
             # SimNow 价格保护自动撤单，实证 2950 时 a→5 直接被清）
             order = state["order_field"]  # 预创建
