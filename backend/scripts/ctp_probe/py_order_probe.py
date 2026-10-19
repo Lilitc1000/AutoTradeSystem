@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 
-FRONT = "tcp://182.254.243.31:30001"  # 第一套交易前置
+FRONT = os.getenv("ORDER_PROBE_FRONT", "tcp://182.254.243.31:30001")  # 第一套交易前置
 
 
 def _load_env() -> None:
@@ -114,13 +114,17 @@ def main() -> int:
                 return
             state["login"] = True
             print(f"[order-probe] 登录成功 TradingDay={pRspUserLogin.TradingDay}", flush=True)
-            # 限价开多 1 手（价格远离市价，不会成交）
+            # 限价开多 1 手（价格略低于市价 ~3084，挂住不成交；远离市价会被
+            # SimNow 价格保护自动撤单，实证 2950 时 a→5 直接被清）
             order = state["order_field"]  # 预创建
             order.BrokerID = BROKER
             order.InvestorID = USER
             order.UserID = USER
             order.InstrumentID = CONTRACT
-            order.OrderRef = "900001"
+            # OrderRef 唯一化（时间戳后6位）：固定值跨进程/跨轮次会撞单
+            order_ref = str(int(time.time()) % 1000000)
+            order.OrderRef = order_ref
+            state["order_ref"] = order_ref
             order.Direction = "0"  # 多
             order.CombOffsetFlag = "0"  # 开
             order.CombHedgeFlag = "1"  # 投机
@@ -190,8 +194,8 @@ def main() -> int:
         api.Release()
         return 1
 
-    # 等委托回报
-    for _ in range(50):
+    # 等委托回报（8 秒：订单从"尚未申报"到"已委托"需时间，5 秒曾太短）
+    for _ in range(80):
         if state["submitted"] or state["traded"]:
             break
         time.sleep(0.1)
@@ -203,7 +207,7 @@ def main() -> int:
     action.InvestorID = USER
     action.UserID = USER
     action.InstrumentID = CONTRACT
-    action.OrderRef = "900001"
+    action.OrderRef = state["order_ref"]  # 与发单同一 OrderRef
     action.ActionFlag = "0"
     api.ReqOrderAction(action, 4)
 
