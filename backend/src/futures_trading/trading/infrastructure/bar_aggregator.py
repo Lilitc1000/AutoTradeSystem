@@ -27,7 +27,8 @@ class BarAggregator:
         self._high: Price | None = None
         self._low: Price | None = None
         self._close: Price | None = None
-        self._volume: Decimal = Decimal("0")
+        self._volume_base: Decimal | None = None  # 周期首 tick 累计量（差值基准）
+        self._volume_last: Decimal | None = None  # 最近 tick 累计量
         self._open_interest: Decimal = Decimal("0")
 
     def _bucket_of(self, ts: datetime) -> datetime:
@@ -37,7 +38,13 @@ class BarAggregator:
         return midnight + timedelta(minutes=minutes - minutes % self.interval_minutes)
 
     def on_tick(self, tick: Tick) -> Bar | None:
-        """喂入 tick；周期切换时返回上一根闭合 bar，否则返回 None。"""
+        """喂入 tick；周期切换时返回上一根闭合 bar，否则返回 None。
+
+        语义（CTP 行情字段性质）：
+        - tick.volume 是**当日累计成交量**——bar.volume 取周期内差值（末-初）
+        - tick.open_interest 是**存量持仓**——bar.open_interest 取期末值
+        （旧实现直接累加，1 分钟 bar 会得到数十万手的错误量，已修）
+        """
         bucket = self._bucket_of(tick.ts)
         closed: Bar | None = None
         if self._bucket is not None and bucket != self._bucket:
@@ -48,11 +55,12 @@ class BarAggregator:
         price = tick.last_price
         if self._open is None:
             self._open = price
+            self._volume_base = Decimal(tick.volume)  # 周期首 tick 的累计量基准
         self._high = price if self._high is None else max(self._high, price)
         self._low = price if self._low is None else min(self._low, price)
         self._close = price
-        self._volume += Decimal(tick.volume)
-        self._open_interest += Decimal(tick.open_interest)
+        self._volume_last = Decimal(tick.volume)
+        self._open_interest = Decimal(tick.open_interest)  # 存量：直接取期末值
         return closed
 
     def flush(self) -> Bar | None:
@@ -62,6 +70,9 @@ class BarAggregator:
     def _close_current(self) -> Bar | None:
         if self._bucket is None or self._open is None or self._close is None:
             return None
+        volume = Decimal("0")
+        if self._volume_base is not None and self._volume_last is not None:
+            volume = max(self._volume_last - self._volume_base, Decimal("0"))
         return Bar(
             symbol=self.symbol,
             interval_minutes=self.interval_minutes,
@@ -70,7 +81,7 @@ class BarAggregator:
             high=self._high if self._high is not None else self._close,
             low=self._low if self._low is not None else self._close,
             close=self._close,
-            volume=Quantity(self._volume),
+            volume=Quantity(volume),
             open_interest=Quantity(self._open_interest),
         )
 
@@ -80,7 +91,8 @@ class BarAggregator:
         self._high = None
         self._low = None
         self._close = None
-        self._volume = Decimal("0")
+        self._volume_base = None
+        self._volume_last = None
         self._open_interest = Decimal("0")
 
 

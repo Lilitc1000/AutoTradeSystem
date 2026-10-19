@@ -187,15 +187,20 @@ class CtpMarketData(MarketDataPort):
         return self
 
     async def start(self) -> None:
-        """一步启动（测试/简单场景用；生产进程请用 create() + run()——
-        start() 在 asyncio task 帧创建 api，有 SWIG segfault 风险）。"""
+        """一步启动（测试/简单场景用：创建 api + 等就绪 + 起消费协程，不常驻）。
+
+        生产进程请用 create() + run()——start() 在 asyncio task 帧创建 api，
+        有 SWIG segfault 风险（见 create() docstring）。
+        """
         md_api, _ = _load_ctp()
         self._api = md_api.CThostFtdcMdApi.CreateFtdcMdApi(self.config.flow_path("flow_md"))
         self._spi = self._make_spi(md_api.CThostFtdcMdSpi)
         self._api.RegisterSpi(self._spi)
         self._api.RegisterFront(self.config.md_front)
         self._api.Init()
-        await self.run()
+        self._loop = asyncio.get_running_loop()
+        await asyncio.to_thread(self._ready.wait, 20)
+        self._consumer = asyncio.create_task(self._consume())
 
     async def run(self, max_runtime_seconds: int = 0) -> None:
         """asyncio 部分：等登录就绪 + 起消费协程 + 常驻（api 已由 create() 建好）。

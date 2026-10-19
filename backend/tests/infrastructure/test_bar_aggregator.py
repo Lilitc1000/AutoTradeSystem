@@ -27,16 +27,16 @@ def tick(ts: datetime, price: str, volume: str = "1", oi: str = "10") -> Tick:
 class TestAggregation:
     def test_single_period(self) -> None:
         agg = BarAggregator("rb", 15)
-        assert agg.on_tick(tick(T0, "3500")) is None
-        assert agg.on_tick(tick(T0 + timedelta(minutes=1), "3510")) is None
-        assert agg.on_tick(tick(T0 + timedelta(minutes=2), "3505")) is None
+        assert agg.on_tick(tick(T0, "3500", volume="1")) is None
+        assert agg.on_tick(tick(T0 + timedelta(minutes=1), "3510", volume="2")) is None
+        assert agg.on_tick(tick(T0 + timedelta(minutes=2), "3505", volume="3")) is None
         bar = agg.flush()
         assert bar is not None
         assert bar.open == Price(Decimal("3500"))
         assert bar.high == Price(Decimal("3510"))
         assert bar.low == Price(Decimal("3500"))
         assert bar.close == Price(Decimal("3505"))
-        assert bar.volume == Quantity(Decimal("3"))
+        assert bar.volume == Quantity(Decimal("2"))  # 累计量差值：3 - 1
         assert bar.ts == T0
 
     def test_period_boundary_closes_bar(self) -> None:
@@ -55,14 +55,15 @@ class TestAggregation:
         assert bar.open == Price(Decimal("3520"))
         assert bar.ts == T0 + timedelta(minutes=15)
 
-    def test_volume_and_oi_accumulate(self) -> None:
+    def test_volume_is_period_delta_and_oi_is_last(self) -> None:
+        """CTP 语义：volume 是当日累计量（bar 取周期差值），oi 是存量（取期末值）。"""
         agg = BarAggregator("rb", 15)
-        agg.on_tick(tick(T0, "3500", volume="5", oi="100"))
-        agg.on_tick(tick(T0 + timedelta(minutes=1), "3501", volume="3", oi="50"))
+        agg.on_tick(tick(T0, "3500", volume="100", oi="100"))  # 周期首 tick（基准）
+        agg.on_tick(tick(T0 + timedelta(minutes=1), "3501", volume="103", oi="50"))
         bar = agg.flush()
         assert bar is not None
-        assert bar.volume == Quantity(Decimal("8"))
-        assert bar.open_interest == Quantity(Decimal("150"))
+        assert bar.volume == Quantity(Decimal("3"))  # 103 - 100（差值，非累加）
+        assert bar.open_interest == Quantity(Decimal("50"))  # 期末值（非累加）
 
     def test_flush_empty_returns_none(self) -> None:
         agg = BarAggregator("rb", 15)
