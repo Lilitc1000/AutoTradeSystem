@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import threading
 from collections.abc import Sequence
@@ -130,6 +131,8 @@ class CtpMarketData(MarketDataPort):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tick_count = 0
         self._api: Any = None
+        self._spi: Any = None
+        self._ctp_thread: threading.Thread | None = None
         self._subscribed: list[str] = []
         self._ready = threading.Event()
         self._consumer: asyncio.Task[None] | None = None
@@ -157,18 +160,50 @@ class CtpMarketData(MarketDataPort):
 
     # ---- 生命周期 ----
 
+    @classmethod
+    def create(
+        cls,
+        config: CtpConfig,
+        bus: Any,
+        instruments: dict[str, Instrument] | None = None,
+        interval_minutes: int = 1,
+    ) -> CtpMarketData:
+        """同步工厂：创建 CTP api 并初始化（进程入口调用）。
+
+        两个 openctp 6.7.11 的 SWIG 稳定性约束（均 gdb 实锤，见 PROJECT.md）：
+        1. CreateFtdcMdApi 内部 NewShadowInstance→PyObject_SetAttr 与 Python GC
+           交互会偶发 segfault（30-60%）——故本方法禁用 GC（交易进程常驻、
+           对象增长有限，不依赖循环引用回收；亦是低延迟系统的标准实践）。
+        2. api 创建后 asyncio 侧只用 run()（start() 保留给测试/Fake 场景）。
+        """
+        gc.disable()
+        self = cls(config, bus, instruments, interval_minutes)
+        md_api, _ = _load_ctp()
+        self._api = md_api.CThostFtdcMdApi.CreateFtdcMdApi(config.flow_path("flow_md"))
+        self._spi = self._make_spi(md_api.CThostFtdcMdSpi)
+        self._api.RegisterSpi(self._spi)
+        self._api.RegisterFront(config.md_front)
+        self._api.Init()
+        return self
+
     async def start(self) -> None:
+        """一步启动（测试/简单场景用；生产进程请用 create() + run()——
+        start() 在 asyncio task 帧创建 api，有 SWIG segfault 风险）。"""
         md_api, _ = _load_ctp()
         self._api = md_api.CThostFtdcMdApi.CreateFtdcMdApi(self.config.flow_path("flow_md"))
         self._spi = self._make_spi(md_api.CThostFtdcMdSpi)
         self._api.RegisterSpi(self._spi)
         self._api.RegisterFront(self.config.md_front)
         self._api.Init()
-        # 等登录（CTP 回调在独立线程，超时不阻塞主流程）
-        await asyncio.to_thread(self._ready.wait, 20)
+        await self.run()
+
+    async def run(self) -> None:
+        """asyncio 部分：等登录就绪 + 起消费协程 + 常驻（api 已由 create() 建好）。"""
         self._loop = asyncio.get_running_loop()
+        await asyncio.to_thread(self._ready.wait, 20)
         self._consumer = asyncio.create_task(self._consume())
-        self._request_subscribe()
+        while True:
+            await asyncio.sleep(1)
 
     async def stop(self) -> None:
         if self._consumer is not None:
@@ -176,7 +211,7 @@ class CtpMarketData(MarketDataPort):
             for agg in self._aggregators.values():
                 bar = agg.flush()
                 if bar is not None:
-                    await self.bus.publish_bar(_bar_payload(bar))
+                    await self.bus.publish_bar(_bar_payload(bar, symbol=agg.symbol))
             self._queue.put_nowait(None)
             try:
                 await asyncio.wait_for(self._consumer, timeout=5)
@@ -216,6 +251,8 @@ class CtpMarketData(MarketDataPort):
                 if pRspInfo is not None and pRspInfo.ErrorID != 0:
                     return
                 owner._ready.set()
+                # 登录成功后订阅（CTP 线程，普通栈帧，避开 asyncio C 栈）
+                owner._request_subscribe()
 
             def OnRtnDepthMarketData(self, pDepthMarketData: Any) -> None:
                 payload = _field_to_dict(pDepthMarketData)
@@ -343,6 +380,8 @@ class CtpTradeGateway(OrderPort):
     # ---- 生命周期 ----
 
     async def start(self) -> None:
+        # SWIG + GC segfault 约束：禁用 GC（同 CtpMarketData.create，见其 docstring）
+        gc.disable()
         _md, trade = _load_ctp()
         self._api = trade.CThostFtdcTraderApi.CreateFtdcTraderApi(self.config.flow_path("flow_td"))
         self._spi = self._make_spi(trade.CThostFtdcTraderSpi)

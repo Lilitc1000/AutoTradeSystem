@@ -42,30 +42,15 @@ def _symbol_of(contract: str) -> str:
     return "".join(ch for ch in contract if not ch.isdigit())
 
 
-async def _run_ctp(contracts: list[str], interval: str) -> None:
-    """CTP 实时行情：订阅 → 聚合 → 发总线（常驻，直到收到停止信号）。"""
-    logger.info("CTP 源启动: contracts=%s interval=%s", contracts, interval)
-    # CTP 订阅用合约代码（rb2601），Instrument 注册表按品种（rb）索引
-    instruments = {c: get_instrument(_symbol_of(c)) for c in contracts}
-    bus = MessageBus()
-    md = CtpMarketData(
-        CtpConfig.from_settings(), bus, instruments, interval_minutes=_INTERVAL_MINUTES.get(interval, 1)
-    )
-    md.subscribe(contracts)
-    logger.info("CtpMarketData start() ...")
+async def _run_ctp(md: CtpMarketData) -> None:
+    """asyncio 部分：运行已创建好的 CtpMarketData（create() 须在主帧先调用）。"""
+    logger.info("CtpMarketData 运行中")
     try:
-        await md.start()
-        logger.info("CtpMarketData 就绪（ready=%s）", md._ready.is_set())
-        seconds = 0
-        while True:
-            await asyncio.sleep(1)
-            seconds += 1
-            if seconds % 10 == 0:
-                logger.info("运行中 %ds，tick 累计 %d", seconds, md._tick_count)
+        await md.run()
     finally:
         logger.info("CTP 源退出，stop() ...")
         await md.stop()
-        await bus.close()
+        await md.bus.close()
 
 
 def main() -> None:
@@ -84,7 +69,17 @@ def main() -> None:
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
 
     if args.source == "ctp":
-        asyncio.run(_run_ctp(symbols, args.interval))
+        # CTP api 创建必须在普通函数帧（main）——SWIG segfault 约束，见 adapters.create
+        logger.info("CTP 源启动: contracts=%s interval=%s", symbols, args.interval)
+        instruments = {c: get_instrument(_symbol_of(c)) for c in symbols}
+        md = CtpMarketData.create(
+            CtpConfig.from_settings(),
+            MessageBus(),
+            instruments,
+            interval_minutes=_INTERVAL_MINUTES.get(args.interval, 1),
+        )
+        md.subscribe(symbols)
+        asyncio.run(_run_ctp(md))
         return
 
     # replay 源懒加载（pandas 链，见模块头说明）
