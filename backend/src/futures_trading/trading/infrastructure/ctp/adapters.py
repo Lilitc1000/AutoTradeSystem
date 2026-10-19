@@ -17,9 +17,12 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import multiprocessing
 import threading
+import time
 from collections.abc import Sequence
 from decimal import Decimal
+from queue import Empty
 from typing import Any
 
 from ....common.settings import settings
@@ -30,6 +33,7 @@ from ...domain.model.instrument import Instrument
 from ...domain.model.order import Order, OrderStatus, PriceType
 from ..bar_aggregator import BarAggregator
 from . import mapping
+from .worker import DISCONNECTED, READY, TICK, run_ctp_worker
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +140,13 @@ class CtpMarketData(MarketDataPort):
         self._subscribed: list[str] = []
         self._ready = threading.Event()
         self._consumer: asyncio.Task[None] | None = None
+        # ---- CTP worker 子进程（崩溃隔离，见 worker.py）----
+        self._mp_queue: Any = None  # multiprocessing.Queue（父↔子）
+        self._worker: Any = None  # multiprocessing.Process
+        self._supervisor: asyncio.Task[None] | None = None
+        self._worker_lifetime: float | None = None
+        self._restart_count = 0
+        self._stopping = False
 
     # ---- MarketDataPort ----
 
@@ -167,58 +178,97 @@ class CtpMarketData(MarketDataPort):
         bus: Any,
         instruments: dict[str, Instrument] | None = None,
         interval_minutes: int = 1,
+        worker_lifetime: float | None = None,
     ) -> CtpMarketData:
-        """同步工厂：创建 CTP api 并初始化（进程入口调用）。
+        """同步工厂：启动 CTP worker **子进程** 并等登录就绪。
 
-        两个 openctp 6.7.11 的 SWIG 稳定性约束（均 gdb 实锤，见 PROJECT.md）：
-        1. CreateFtdcMdApi 内部 NewShadowInstance→PyObject_SetAttr 与 Python GC
-           交互会偶发 segfault（30-60%）——故本方法禁用 GC（交易进程常驻、
-           对象增长有限，不依赖循环引用回收；亦是低延迟系统的标准实践）。
-        2. api 创建后 asyncio 侧只用 run()（start() 保留给测试/Fake 场景）。
+        为什么改成子进程（M2 工程化）：openctp 的 SWIG 崩溃发生在 C++ 扩展侧，
+        同进程会带走整个 worker（聚合状态/Redis 连接/心跳全丢，夜盘实测崩率
+        ~50%）。隔离后崩溃只杀子进程，父进程重启即可，业务状态无感（vnpy 架构）。
+
+        worker_lifetime：子进程存活秒数（None=常驻）；到期主动退出由父进程重启，
+        兼作禁 GC 进程的内存重置机制。
+
+        注意：本方法只构造对象——worker 在 run()/start() 里启动（那时
+        subscribe() 已完成，合约列表才不为空；spawn 子进程是全新解释器，
+        不存在"asyncio 帧创建 api"的 SWIG 约束）。
         """
-        gc.disable()
         self = cls(config, bus, instruments, interval_minutes)
-        md_api, _ = _load_ctp()
-        self._api = md_api.CThostFtdcMdApi.CreateFtdcMdApi(config.flow_path("flow_md"))
-        self._spi = self._make_spi(md_api.CThostFtdcMdSpi)
-        self._api.RegisterSpi(self._spi)
-        self._api.RegisterFront(config.md_front)
-        self._api.Init()
+        self._worker_lifetime = worker_lifetime
         return self
 
     async def start(self) -> None:
-        """一步启动（测试/简单场景用：创建 api + 等就绪 + 起消费协程，不常驻）。
-
-        生产进程请用 create() + run()——start() 在 asyncio task 帧创建 api，
-        有 SWIG segfault 风险（见 create() docstring）。
-        """
-        md_api, _ = _load_ctp()
-        self._api = md_api.CThostFtdcMdApi.CreateFtdcMdApi(self.config.flow_path("flow_md"))
-        self._spi = self._make_spi(md_api.CThostFtdcMdSpi)
-        self._api.RegisterSpi(self._spi)
-        self._api.RegisterFront(self.config.md_front)
-        self._api.Init()
+        """一步启动（测试/Fake 场景）：起 worker + 等就绪 + 起消费协程，不常驻。"""
+        if self._worker is None:
+            self._start_worker()
+            await asyncio.to_thread(self._drain_until_ready, 20)
         self._loop = asyncio.get_running_loop()
-        await asyncio.to_thread(self._ready.wait, 20)
         self._consumer = asyncio.create_task(self._consume())
+        # 监督协程（崩溃重启）在 start/run 两条路径都要起——否则 start 场景
+        # worker 崩了无人重启
+        self._supervisor = asyncio.create_task(self._supervise())
+
+    def _start_worker(self) -> None:
+        """启动（或重启）CTP worker 子进程。"""
+        ctx = multiprocessing.get_context("spawn")
+        if self._mp_queue is None:
+            self._mp_queue = ctx.Queue()
+        self._worker = ctx.Process(
+            target=run_ctp_worker,
+            args=(self._mp_queue, self.config, list(self._subscribed), self._worker_lifetime),
+            name="ctp-md-worker",
+            daemon=True,
+        )
+        self._worker.start()
+        logger.info("CTP worker 子进程启动 pid=%s contracts=%s", self._worker.pid, self._subscribed)
+
+    def _drain_until_ready(self, timeout: float) -> None:
+        """同步消费队列直到 worker 登录就绪（create/start 阶段用）。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._ready.is_set():
+            try:
+                item = self._mp_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            if isinstance(item, dict) and item.get("type") == READY:
+                self._ready.set()
+                return
 
     async def run(self, max_runtime_seconds: int = 0) -> None:
-        """asyncio 部分：等登录就绪 + 起消费协程 + 常驻（api 已由 create() 建好）。
+        """asyncio 侧：消费 worker 队列 + 监督子进程 + 常驻。
 
-        max_runtime_seconds>0：到时主动退出（禁 GC 进程的内存重置机制——
-        由守护进程重启，规避循环引用垃圾的长跑累积；0=不限）。
+        max_runtime_seconds>0：到时父进程主动退出（守护重启，重置内存）。
         """
         self._loop = asyncio.get_running_loop()
-        await asyncio.to_thread(self._ready.wait, 20)
+        # worker 在 subscribe 之后启动（合约列表此时已就绪）
+        if self._worker is None:
+            self._start_worker()
+            await asyncio.to_thread(self._drain_until_ready, 20)
         self._consumer = asyncio.create_task(self._consume())
+        self._supervisor = asyncio.create_task(self._supervise())
         started = asyncio.get_running_loop().time()
         while True:
             await asyncio.sleep(1)
             if max_runtime_seconds > 0 and asyncio.get_running_loop().time() - started >= max_runtime_seconds:
-                logger.info("到达 max_runtime=%ds，主动退出（守护将重启，重置内存）", max_runtime_seconds)
+                logger.info("到达 max_runtime=%ds，主动退出（守护将重启）", max_runtime_seconds)
                 return
 
+    async def _supervise(self) -> None:
+        """子进程监督：worker 崩溃/退出则重启（崩溃隔离的核心逻辑）。"""
+        while True:
+            await asyncio.sleep(2)
+            if self._stopping or self._worker is None:
+                continue
+            if not self._worker.is_alive():
+                self._restart_count += 1
+                logger.warning(
+                    "CTP worker 退出（exitcode=%s），第 %d 次重启", self._worker.exitcode, self._restart_count
+                )
+                self._ready.clear()
+                self._start_worker()
+
     async def stop(self) -> None:
+        self._stopping = True
         if self._consumer is not None:
             # flush 未闭合的 bar 一并发布
             for agg in self._aggregators.values():
@@ -231,9 +281,14 @@ class CtpMarketData(MarketDataPort):
             except (TimeoutError, asyncio.CancelledError):  # noqa: UP041
                 self._consumer.cancel()
             self._consumer = None
-        if self._api is not None:
-            self._api.Release()
-            self._api = None
+        if self._supervisor is not None:
+            self._supervisor.cancel()
+            self._supervisor = None
+        if self._worker is not None and self._worker.is_alive():
+            logger.info("终止 CTP worker 子进程 pid=%s", self._worker.pid)
+            self._worker.terminate()
+            self._worker.join(timeout=5)
+        self._worker = None
 
     # ---- 内部 ----
 
@@ -299,19 +354,55 @@ class CtpMarketData(MarketDataPort):
         return _MdSpi()
 
     async def _consume(self) -> None:
+        """父进程侧消费：从 worker 子进程队列取消息 → 映射 → 聚合 → 发布。
+
+        用协程轮询（get_nowait + sleep）而非阻塞线程取：tick 量小（rb 每秒
+        2-4 笔），轮询开销可忽略，且彻底避开阻塞线程挂住事件循环的坑。
+        （聚合与发布都在父进程——worker 崩了不丢 bar 上下文。）
+        """
+        assert self._mp_queue is not None
         while True:
-            payload = await self._queue.get()
-            if payload is None:
-                return
+            try:
+                item = self._mp_queue.get_nowait()
+            except Empty:
+                # 同时处理父进程内部队列（stop 的 sentinel 走这里）
+                try:
+                    inner = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.05)
+                    continue
+                if inner is None:
+                    return
+                continue
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("type")
+            if kind == READY:
+                self._ready.set()
+            elif kind == DISCONNECTED:
+                logger.warning("CTP 连接断开（worker 上报 reason=%s）", item.get("reason"))
+            elif kind == TICK:
+                await self._on_tick(item.get("data") or {})
+
+    async def _on_tick(self, payload: dict[str, Any]) -> None:
+        """tick → 映射 → 聚合 → 发布（原在 spi 回调线程内，现移到父进程）。"""
+        contract = str(payload.get("InstrumentID", ""))
+        if not contract:
+            return
+        symbol = self._contract_to_symbol.get(contract, contract)
+        tick = mapping.ctp_depth_to_tick(payload, symbol=contract)
+        self._tick_count += 1
+        if self._tick_count % 20 == 1:
             logger.info(
-                "bar 闭合: %s %s ts=%s close=%s vol=%s",
-                payload.get("contract"),
-                f"{payload.get('interval_minutes')}m",
-                payload.get("ts"),
-                payload.get("close"),
-                payload.get("volume"),
+                "CTP tick 流: %s 第 %d 笔 last=%s", contract, self._tick_count, payload.get("LastPrice")
             )
-            await self.bus.publish_bar(payload)
+        agg = self._aggregators.get(symbol)
+        if agg is None:
+            agg = BarAggregator(symbol, self.interval_minutes)
+            self._aggregators[symbol] = agg
+        bar = agg.on_tick(tick)
+        if bar is not None:
+            await self.bus.publish_bar(_bar_payload(bar, symbol=symbol))
 
 
 class CtpTradeGateway(OrderPort):

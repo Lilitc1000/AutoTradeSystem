@@ -217,6 +217,80 @@ def _command() -> OrderCommand:
     )
 
 
+# ---- CTP worker 子进程测试替身（崩溃隔离架构）----
+
+
+class _FakeProcess:
+    """用线程模拟 multiprocessing.Process（测试内不起真子进程）。"""
+
+    def __init__(self, target: Any = None, args: tuple[Any, ...] = (), name: str = "", daemon: bool = True) -> None:
+        self.target = target
+        self.args = args
+        self.pid = 12345
+        self.exitcode: int | None = 0
+        self._thread: Any = None
+
+    def start(self) -> None:
+        import threading as _threading
+
+        self._thread = _threading.Thread(target=self.target, args=self.args, daemon=True)
+        self._thread.start()
+
+    def is_alive(self) -> bool:
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    def terminate(self) -> None:
+        self.exitcode = -15
+
+    def join(self, timeout: float | None = None) -> None:
+        return
+
+
+class _FakeCtx:
+    def Queue(self) -> Any:
+        import queue as _queue
+
+        return _queue.Queue()
+
+    def Process(self, **kwargs: Any) -> _FakeProcess:
+        return _FakeProcess(**kwargs)
+
+
+def _install_fake_mp(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(A.multiprocessing, "get_context", lambda _name: _FakeCtx())
+
+
+def _fake_worker(q: Any, config: Any, contracts: list[str], lifetime: float | None = None) -> None:
+    """Fake worker：把预设消息塞进队列（记录调用参数）。"""
+    _fake_worker.calls.append((list(contracts), lifetime))  # type: ignore[attr-defined]
+    for item in _fake_worker.queue_put:  # type: ignore[attr-defined]
+        q.put(item)
+    if _fake_worker.exit_immediately:  # type: ignore[attr-defined]
+        return  # 模拟崩溃退出
+    import time as _time
+
+    _time.sleep(30)
+
+
+_fake_worker.calls = []  # type: ignore[attr-defined]
+_fake_worker.queue_put = []  # type: ignore[attr-defined]
+_fake_worker.exit_immediately = False  # type: ignore[attr-defined]
+
+
+def _depth_dict(symbol: str, time_str: str, last: str) -> dict[str, Any]:
+    """worker 上报的 tick 字典（等价于 _field_to_dict(行情字段)）。"""
+    return {
+        "InstrumentID": symbol,
+        "UpdateTime": time_str,
+        "UpdateMillisec": 0,
+        "LastPrice": last,
+        "Volume": 10,
+        "OpenInterest": 100,
+        "BidPrice1": last,
+        "AskPrice1": last,
+    }
+
+
 def _depth(symbol: str, time_str: str, last: str) -> Any:
     field = FakeField()
     field.InstrumentID = symbol
@@ -239,38 +313,64 @@ class TestCtpMarketData:
         md.subscribe(["rb"])
         assert md._subscribed == ["rb"]  # noqa: SLF001
 
-    async def test_start_requests_subscribe_with_bytes(self) -> None:
-        bus = FakeBus()
-        md = A.CtpMarketData(A.CtpConfig(), bus, {"rb": _instrument()})
+    async def test_start_spawns_worker_with_contracts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """父侧契约：启动 worker 子进程并传入订阅合约列表。"""
+        _install_fake_mp(monkeypatch)
+        _fake_worker.calls.clear()
+        _fake_worker.queue_put = [{"type": A.READY, "trading_day": "20260101"}]
+        monkeypatch.setattr(A, "run_ctp_worker", _fake_worker)
+        md = A.CtpMarketData(A.CtpConfig(), FakeBus(), {"rb": _instrument()})
         md.subscribe(["rb"])
         await md.start()
-        api = FakeMdApi.instances[0]
-        subs = [c for c in api.calls if c[0] == "SubscribeMarketData"]
-        assert subs, "登录后应补订"
-        codes, count = subs[0][1]
-        assert codes == [b"rb"]  # char*[] typemap 要 bytes
-        assert count == 1
+        assert _fake_worker.calls, "应启动 CTP worker"
+        contracts, _lifetime = _fake_worker.calls[0]
+        assert contracts == ["rb"]
+        assert md._ready.is_set()  # noqa: SLF001  # READY 消息后置位
         await md.stop()
 
-    async def test_tick_aggregates_and_publishes_bar_on_interval_cross(self) -> None:
+    async def test_worker_exit_triggers_restart(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """崩溃隔离核心：worker 退出 → 父进程自动重启（计数递增）。"""
+        _install_fake_mp(monkeypatch)
+        _fake_worker.calls.clear()
+        _fake_worker.queue_put = [{"type": A.READY, "trading_day": "20260101"}]
+        _fake_worker.exit_immediately = True  # 模拟崩溃
+        monkeypatch.setattr(A, "run_ctp_worker", _fake_worker)
+        md = A.CtpMarketData(A.CtpConfig(), FakeBus(), {"rb": _instrument()})
+        md.subscribe(["rb"])
+        await md.start()
+        # 监督协程每 2 秒巡检一次，等它发现 worker 退出并重启
+        import asyncio
+
+        for _ in range(40):
+            if md._restart_count >= 1:  # noqa: SLF001
+                break
+            await asyncio.sleep(0.1)
+        assert md._restart_count >= 1  # noqa: SLF001  # 监督协程已重启过
+        _fake_worker.exit_immediately = False
+        await md.stop()
+
+    async def test_tick_from_worker_aggregates_and_publishes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """worker 上报 tick → 父进程聚合 → 跨周期发布 bar。"""
+        import asyncio as _asyncio
+
+        _install_fake_mp(monkeypatch)
+        _fake_worker.calls.clear()
+        _fake_worker.exit_immediately = False
+        _fake_worker.queue_put = [
+            {"type": A.READY, "trading_day": "20260101"},
+            {"type": A.TICK, "data": _depth_dict("rb", "09:00:10", "3450")},
+            {"type": A.TICK, "data": _depth_dict("rb", "09:00:30", "3455")},
+            {"type": A.TICK, "data": _depth_dict("rb", "09:01:05", "3460")},
+        ]
+        monkeypatch.setattr(A, "run_ctp_worker", _fake_worker)
         bus = FakeBus()
         md = A.CtpMarketData(A.CtpConfig(), bus, {"rb": _instrument()}, interval_minutes=1)
         md.subscribe(["rb"])
         await md.start()
-        spi = md._spi  # noqa: SLF001
-        # 同一分钟内：不闭合
-        spi.OnRtnDepthMarketData(_depth("rb", "09:00:10", "3450"))
-        spi.OnRtnDepthMarketData(_depth("rb", "09:00:30", "3455"))
-        assert bus.bars == []
-        # 跨分钟：闭合上一根
-        spi.OnRtnDepthMarketData(_depth("rb", "09:01:05", "3460"))
-        # 等消费协程发布
-        import asyncio
-
-        for _ in range(50):
+        for _ in range(80):
             if bus.bars:
                 break
-            await asyncio.sleep(0.02)
+            await _asyncio.sleep(0.02)
         assert len(bus.bars) == 1
         assert bus.bars[0]["symbol"] == "rb"
         assert bus.bars[0]["close"] == "3455"  # 上一根收盘
