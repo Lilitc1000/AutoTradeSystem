@@ -35,6 +35,8 @@ class FakeRspInfo:
 
 class FakeLoginResp:
     TradingDay = "20260101"
+    FrontID = 1
+    SessionID = 1
 
 
 class FakeBus:
@@ -126,6 +128,11 @@ class FakeTdApi:
         if self.spi is not None:
             self.spi.OnRspAuthenticate(FakeField(), FakeRspInfo(0), request_id, True)
 
+    def ReqSettlementInfoConfirm(self, field: Any, request_id: int) -> None:
+        self.calls.append(("ReqSettlementInfoConfirm", field))
+        if self.spi is not None:
+            self.spi.OnRspSettlementInfoConfirm(FakeField(), FakeRspInfo(0), request_id, True)
+
     def ReqUserLogin(self, field: Any, request_id: int) -> None:
         self.calls.append(("ReqUserLogin", field))
         if self.spi is not None:
@@ -169,6 +176,7 @@ class FakeTdModule:
     CThostFtdcTraderSpi = FakeTdSpi
     CThostFtdcReqAuthenticateField = FakeField
     CThostFtdcReqUserLoginField = FakeField
+    CThostFtdcSettlementInfoConfirmField = FakeField
     CThostFtdcInputOrderField = FakeField
     CThostFtdcInputOrderActionField = FakeField
     CThostFtdcQryTradingAccountField = FakeField

@@ -30,8 +30,13 @@ def offset_to_ctp(offset: Offset) -> str:
 
 
 def price_type_to_ctp(price_type: PriceType) -> str:
-    """域价格类型 → CTP 报单价格类型字符（'1'=限价 '2'=市价/任意价）。"""
-    return "1" if price_type is PriceType.LIMIT else "2"
+    """域价格类型 → CTP 报单价格类型字符。
+
+    CTP 编码反直觉（ThostFtdcUserApiDataType.h）：'1'=任意价(市价) '2'=限价。
+    曾错填 LIMIT→'1'（发成市价单）→ SHFE 错误码 79「不被支持的报单类型」
+    → 订单 a→5 被撤（夜盘联调 21:19 实锤）。勿改回。
+    """
+    return "2" if price_type is PriceType.LIMIT else "1"
 
 
 def ctp_to_order_status(ctp_status: str, ctp_order_submit_status: str = "0") -> OrderStatus:

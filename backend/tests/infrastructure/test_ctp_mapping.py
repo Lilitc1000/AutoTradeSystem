@@ -21,8 +21,9 @@ class TestEnumMapping:
         assert mapping.offset_to_ctp(Offset.CLOSE) == "1"
 
     def test_price_type(self) -> None:
-        assert mapping.price_type_to_ctp(PriceType.LIMIT) == "1"
-        assert mapping.price_type_to_ctp(PriceType.MARKET) == "2"
+        # CTP 编码反直觉：'1'=任意价(市价) '2'=限价（夜盘联调 79 号错误实锤）
+        assert mapping.price_type_to_ctp(PriceType.LIMIT) == "2"
+        assert mapping.price_type_to_ctp(PriceType.MARKET) == "1"
 
     def test_ctp_status_to_domain(self) -> None:
         assert mapping.ctp_to_order_status("0") is OrderStatus.FILLED
@@ -48,7 +49,7 @@ class TestCommandMapping:
         ctp = mapping.command_to_ctp_input(command)
         assert ctp["Direction"] == "0"
         assert ctp["CombOffsetFlag"] == "0"
-        assert ctp["OrderPriceType"] == "2"
+        assert ctp["OrderPriceType"] == "1"  # CTP: '1'=任意价(市价)
         assert ctp["VolumeTotalOriginal"] == 2
         assert ctp["LimitPrice"] == 0.0
 
@@ -66,7 +67,7 @@ class TestCommandMapping:
         ctp = mapping.command_to_ctp_input(command)
         assert ctp["Direction"] == "1"
         assert ctp["CombOffsetFlag"] == "1"
-        assert ctp["OrderPriceType"] == "1"
+        assert ctp["OrderPriceType"] == "2"  # CTP: '2'=限价（编码反直觉）
         assert ctp["LimitPrice"] == 3456.5
 
 

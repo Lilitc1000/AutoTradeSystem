@@ -339,6 +339,8 @@ class CtpTradeGateway(OrderPort):
         self._consumer: asyncio.Task[None] | None = None
         # 账户快照（由 CtpAccount 代理读取）
         self._spi: Any = None
+        self._front_id = 0  # 撤单定位三件套（OnRspUserLogin 记录）
+        self._session_id = 0
         self._balance: Decimal = Decimal("0")
         self._positions: list[Any] = []
         self._account_waiter = threading.Event()
@@ -390,6 +392,9 @@ class CtpTradeGateway(OrderPort):
             "OrderRef": order_id[-12:],
             "InstrumentID": order.contract,
             "ActionFlag": "0",
+            # 撤单定位三件套：FrontID+SessionID+OrderRef（缺前二柜台报"找不到相应报单"）
+            "FrontID": self._front_id,
+            "SessionID": self._session_id,
         }
         self._request_id += 1
         self._api.ReqOrderAction(_to_field(values, trade.CThostFtdcInputOrderActionField), self._request_id)
@@ -516,6 +521,22 @@ class CtpTradeGateway(OrderPort):
             def OnRspUserLogin(self, pRspUserLogin: Any, pRspInfo: Any, nRequestID: int, bIsLast: bool) -> None:
                 if pRspInfo is not None and pRspInfo.ErrorID != 0:
                     return
+                owner._front_id = int(pRspUserLogin.FrontID)
+                owner._session_id = int(pRspUserLogin.SessionID)
+                # CTP 规范：交易日首次报单前必须确认结算单（快期/vnpy 自动做；
+                # 夜盘联调实证：确认链路是报单前置步骤）
+                confirm = _to_field(
+                    {"BrokerID": owner.config.broker_id, "InvestorID": owner.config.user_id},
+                    _load_ctp()[1].CThostFtdcSettlementInfoConfirmField,
+                )
+                owner._api.ReqSettlementInfoConfirm(confirm, 3)
+
+            def OnRspSettlementInfoConfirm(
+                self, pSettlementInfoConfirm: Any, pRspInfo: Any, nRequestID: int, bIsLast: bool
+            ) -> None:
+                if pRspInfo is not None and pRspInfo.ErrorID != 0:
+                    return
+                # 结算单确认完成后才解锁 ready（submit 前置条件）
                 owner._ready.set()
 
             def OnRtnOrder(self, pOrder: Any) -> None:

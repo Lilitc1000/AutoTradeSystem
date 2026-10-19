@@ -24,6 +24,32 @@ import time
 FRONT = os.getenv("ORDER_PROBE_FRONT", "tcp://182.254.243.31:30001")  # 第一套交易前置
 
 
+def _local_ip() -> str:
+    """本机出口 IP（看穿式报单字段 IPAddress 用）。"""
+    import socket
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        sock.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
+
+
+def _local_mac() -> str:
+    """本机 MAC（看穿式报单字段 MacAddress 用）：Linux 读 sysfs，Windows 用 uuid.getnode。"""
+    try:
+        with open("/sys/class/net/eth0/address", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        import uuid
+
+        node = uuid.getnode()
+        return ":".join(f"{(node >> shift) & 0xFF:02x}" for shift in range(40, -1, -8))
+
+
 def _load_env() -> None:
     """环境变量缺凭证时，从 .devcontainer/.env 补全（仅 setdefault，不覆盖）。"""
     if os.getenv("SIMNOW_USER_ID"):
@@ -71,6 +97,8 @@ def main() -> int:
     from openctp_ctp.thosttraderapi import (
         CThostFtdcSettlementInfoConfirmField,
         CThostFtdcQryOrderField,
+        CThostFtdcQryInstrumentField,
+        CThostFtdcQryTradingAccountField,
         CThostFtdcReqAuthenticateField,
         CThostFtdcReqUserLoginField,
         CThostFtdcInputOrderActionField,
@@ -90,6 +118,8 @@ def main() -> int:
     state["action_field"] = CThostFtdcInputOrderActionField()
     state["qry_field"] = CThostFtdcQryOrderField()
     state["confirm_field"] = CThostFtdcSettlementInfoConfirmField()
+    state["instrument_field"] = CThostFtdcQryInstrumentField()
+    state["account_field"] = CThostFtdcQryTradingAccountField()
 
     class Impl(CThostFtdcTraderSpi):
         def OnFrontConnected(self) -> None:
@@ -117,6 +147,9 @@ def main() -> int:
                 print(f"[order-probe] 登录失败 {pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}", flush=True)
                 return
             state["login"] = True
+            # 撤单定位需要 FrontID+SessionID（配合 OrderRef 定位本会话订单）
+            state["front_id"] = pRspUserLogin.FrontID
+            state["session_id"] = pRspUserLogin.SessionID
             print(f"[order-probe] 登录成功 TradingDay={pRspUserLogin.TradingDay}", flush=True)
             # CTP 规范：交易日首次报单前必须确认结算单（快期/vnpy 自动做，
             # 我们此前漏了——订单 a→5 被自动撤的第一嫌疑人）。
@@ -131,6 +164,39 @@ def main() -> int:
                 print(f"[order-probe] 结算单确认失败 {pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}", flush=True)
                 return
             print("[order-probe] 结算单已确认", flush=True)
+            # 先查资金（可用余额不足也是 a→5 候选：持仓押着保证金）
+            acct = state["account_field"]
+            acct.BrokerID = BROKER
+            acct.InvestorID = USER
+            api.ReqQryTradingAccount(acct, 7)
+
+        def OnRspQryTradingAccount(self, pTradingAccount, pRspInfo, nRequestID, bIsLast) -> None:
+            if pTradingAccount:
+                print(
+                    f"[order-probe] 资金: 可用={pTradingAccount.Available} "
+                    f"余额={pTradingAccount.Balance} 保证金={pTradingAccount.CurrMargin}",
+                    flush=True,
+                )
+            if pRspInfo and pRspInfo.ErrorID != 0:
+                print(f"[order-probe] 资金查询失败 {pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}", flush=True)
+                return
+            # 资金查完查合约（vnpy/快期登录后都做一揽子初始化查询；
+            # 合约未同步柜台可能拒单——a→5 排查候选）
+            instr = state["instrument_field"]
+            instr.BrokerID = BROKER
+            instr.InvestorID = USER
+            instr.InstrumentID = CONTRACT
+            api.ReqQryInstrument(instr, 6)
+
+        def OnRspQryInstrument(self, pInstrument, pRspInfo, nRequestID, bIsLast) -> None:
+            if pInstrument:
+                print(f"[order-probe] 合约信息 {pInstrument.InstrumentID}", flush=True)
+            if pRspInfo and pRspInfo.ErrorID != 0:
+                print(f"[order-probe] 合约查询失败 {pRspInfo.ErrorID}: {pRspInfo.ErrorMsg}", flush=True)
+                return
+            if not bIsLast:
+                return  # 前缀匹配返回多个合约（期货+期权系列），只认最后一个
+            print("[order-probe] 合约查询完成，发单", flush=True)
             # 限价开多 1 手（价格略低于市价 ~3084，挂住不成交；远离市价会被
             # SimNow 价格保护自动撤单，实证 2950 时 a→5 直接被清）
             order = state["order_field"]  # 预创建
@@ -145,7 +211,8 @@ def main() -> int:
             order.Direction = "0"  # 多
             order.CombOffsetFlag = "0"  # 开
             order.CombHedgeFlag = "1"  # 投机
-            order.OrderPriceType = "1"  # 限价
+            order.OrderPriceType = "2"  # 限价（CTP 编码反直觉：'1'=任意价/市价，'2'=限价！
+            #                              错填 '1' 发市价单 → SHFE 不支持 → 79 号错误 a→5）
             order.LimitPrice = float(PRICE)
             order.VolumeTotalOriginal = 1
             order.TimeCondition = "3"  # 当日有效
@@ -153,19 +220,32 @@ def main() -> int:
             order.ContingentCondition = "1"
             order.ForceCloseReason = "0"
             order.MinVolume = 1
+            # 看穿式监管：报单必须带终端信息（快期/vnpy 都填，我们此前漏了）
+            order.IPAddress = _local_ip()
+            order.MacAddress = _local_mac()
+            order.UserProductInfo = "ats_dev_probe"
             print(f"[order-probe] 发限价单 {CONTRACT} 开多 1手 @ {PRICE}", flush=True)
             api.ReqOrderInsert(order, 3)
 
         def OnRtnOrder(self, pOrder) -> None:
             status = pOrder.OrderStatus
             submit_status = pOrder.OrderSubmitStatus
+            # StatusMsg 是中文（GBK），patch 把 locale 缩为 "C" 后可能为空/乱码——
+            # 打原始字节长度与 repr，避免被"看起来是空"骗过
+            raw = pOrder.StatusMsg
+            try:
+                decoded = raw.encode("latin-1").decode("gbk") if isinstance(raw, str) else raw
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                decoded = raw
             print(
                 f"[order-probe] 委托回报 OrderRef={pOrder.OrderRef} "
                 f"OrderStatus={status} OrderSubmitStatus={submit_status} "
-                f"StatusMsg={pOrder.StatusMsg}",
+                f"raw_len={len(str(raw))} StatusMsg={decoded!r}",
                 flush=True,
             )
-            if submit_status == "0" and status == "2":
+            # 已委托判定：2=全部成交前挂单确认，3=部分成交/未成交挂单中
+            # （1 手单直接 3，不经过 2——此前只认 2 导致挂单成功也判 FAIL）
+            if submit_status == "0" and status in ("2", "3"):
                 state["submitted"] = True
             if status == "5":  # 已撤
                 state["cancelled"] = True
@@ -239,6 +319,8 @@ def main() -> int:
     action.UserID = USER
     action.InstrumentID = CONTRACT
     action.OrderRef = state["order_ref"]  # 与发单同一 OrderRef
+    action.FrontID = state["front_id"]  # 撤单定位三件套：FrontID+SessionID+OrderRef
+    action.SessionID = state["session_id"]
     action.ActionFlag = "0"
     api.ReqOrderAction(action, 4)
 
