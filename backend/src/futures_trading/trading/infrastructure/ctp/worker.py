@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from queue import Empty
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,10 @@ logger = logging.getLogger(__name__)
 READY = "ready"
 TICK = "tick"
 DISCONNECTED = "disconnected"
+ORDER = "order"  # 委托回报（子→父）
+TRADE = "trade"  # 成交回报（子→父）
+ACCOUNT = "account"  # 资金快照（子→父）
+POSITION = "position"  # 持仓快照（子→父）
 
 
 _FIELDS = (
@@ -45,13 +50,13 @@ _FIELDS = (
 )
 
 
-def _snapshot(field: Any) -> dict[str, Any]:
-    """行情字段 → 纯 Python 字典（可 pickle，供跨进程队列传输）。
+def _snapshot(field: Any, fields: tuple[str, ...] = _FIELDS) -> dict[str, Any]:
+    """行情/回报字段 → 纯 Python 字典（可 pickle，供跨进程队列传输）。
 
     显式取值而非通用反射：通用转换会带回 SwigPyObject（无法 pickle）。
     """
     out: dict[str, Any] = {}
-    for name in _FIELDS:
+    for name in fields:
         value = getattr(field, name, None)
         if value is None:
             continue
@@ -59,22 +64,212 @@ def _snapshot(field: Any) -> dict[str, Any]:
     return out
 
 
+_ORDER_FIELDS = (
+    "OrderRef",
+    "InstrumentID",
+    "OrderStatus",
+    "OrderSubmitStatus",
+    "StatusMsg",
+    "VolumeTotalOriginal",
+    "VolumeTraded",
+    "Direction",
+    "CombOffsetFlag",
+    "LimitPrice",
+    "FrontID",
+    "SessionID",
+)
+_TRADE_FIELDS = (
+    "OrderRef",
+    "InstrumentID",
+    "TradeID",
+    "Volume",
+    "Price",
+    "Direction",
+    "TradeDate",
+    "TradeTime",
+)
+_ACCOUNT_FIELDS = ("Available", "Balance", "CurrMargin", "PositionProfit", "CloseProfit")
+_POSITION_FIELDS = (
+    "InstrumentID",
+    "Direction",
+    "Position",
+    "YdPosition",
+    "TodayPosition",
+    "PositionCost",
+    "UseMargin",
+)
+
+
+def _assign(field: Any, values: dict[str, Any]) -> None:
+    """把指令字段写入预创建的 SWIG field（回调/指令线程内不构造新对象）。"""
+    for key, value in values.items():
+        setattr(field, key, value)
+
+
+def _handle_cmd(
+    api: Any, cmd: dict[str, Any], order_field: Any, action_field: Any, acct_field: Any, pos_field: Any
+) -> None:
+    """执行父进程下发的指令（submit/cancel/query_account）。"""
+    state = _CMD_STATE
+    state["req_id"] += 1
+    action = cmd.get("action")
+    values = cmd.get("values") or {}
+    if action == "submit":
+        _assign(order_field, values)
+        logger.info("[ctp-worker-td] 发单 %s", values.get("InstrumentID"))
+        api.ReqOrderInsert(order_field, state["req_id"])
+    elif action == "cancel":
+        _assign(action_field, values)
+        api.ReqOrderAction(action_field, state["req_id"])
+    elif action == "query_account":
+        api.ReqQryTradingAccount(acct_field, state["req_id"])
+    elif action == "query_position":
+        api.ReqQryInvestorPosition(pos_field, state["req_id"])
+
+
+_CMD_STATE: dict[str, int] = {"req_id": 0}
+
+
+def _run_td(q: Any, cmd_q: Any, config: Any, lifetime: float | None) -> None:
+    """交易子进程：认证 → 登录 → 结算单确认 → 指令循环。"""
+    from openctp_ctp.thosttraderapi import (
+        CThostFtdcInputOrderActionField,
+        CThostFtdcInputOrderField,
+        CThostFtdcQryInvestorPositionField,
+        CThostFtdcQryTradingAccountField,
+        CThostFtdcReqAuthenticateField,
+        CThostFtdcReqUserLoginField,
+        CThostFtdcSettlementInfoConfirmField,
+        CThostFtdcTraderApi,
+        CThostFtdcTraderSpi,
+    )
+
+    # 约束 2：全部预创建（回调线程内构造 SWIG 对象会 segfault）
+    auth_field = CThostFtdcReqAuthenticateField()
+    auth_field.BrokerID = config.broker_id
+    auth_field.UserID = config.user_id
+    auth_field.AppID = config.app_id
+    auth_field.AuthCode = config.auth_code
+    login_field = CThostFtdcReqUserLoginField()
+    login_field.BrokerID = config.broker_id
+    login_field.UserID = config.user_id
+    login_field.Password = config.password
+    confirm_field = CThostFtdcSettlementInfoConfirmField()
+    confirm_field.BrokerID = config.broker_id
+    confirm_field.InvestorID = config.user_id
+    order_field = CThostFtdcInputOrderField()
+    action_field = CThostFtdcInputOrderActionField()
+    acct_field = CThostFtdcQryTradingAccountField()
+    acct_field.BrokerID = config.broker_id
+    acct_field.InvestorID = config.user_id
+    pos_field = CThostFtdcQryInvestorPositionField()
+    pos_field.BrokerID = config.broker_id
+    pos_field.InvestorID = config.user_id
+
+    api: Any = None
+
+    class _TdSpi(CThostFtdcTraderSpi):
+        def OnFrontConnected(self) -> None:
+            logger.info("[ctp-worker-td] 前置连接成功 %s", config.trade_front)
+            api.ReqAuthenticate(auth_field, 1)
+
+        def OnRspAuthenticate(self, pAuth: Any, pRspInfo: Any, nRequestID: int, bIsLast: bool) -> None:
+            if pRspInfo is not None and pRspInfo.ErrorID != 0:
+                logger.error("[ctp-worker-td] 认证失败 %s: %s", pRspInfo.ErrorID, pRspInfo.ErrorMsg)
+                return
+            logger.info("[ctp-worker-td] 认证成功（看穿式）")
+            api.ReqUserLogin(login_field, 2)
+
+        def OnRspUserLogin(self, pLogin: Any, pRspInfo: Any, nRequestID: int, bIsLast: bool) -> None:
+            if pRspInfo is not None and pRspInfo.ErrorID != 0:
+                logger.error("[ctp-worker-td] 登录失败 %s: %s", pRspInfo.ErrorID, pRspInfo.ErrorMsg)
+                return
+            _CMD_STATE["front_id"] = int(getattr(pLogin, "FrontID", 0))
+            _CMD_STATE["session_id"] = int(getattr(pLogin, "SessionID", 0))
+            logger.info("[ctp-worker-td] 登录成功 TradingDay=%s", getattr(pLogin, "TradingDay", "?"))
+            api.ReqSettlementInfoConfirm(confirm_field, 3)
+
+        def OnRspSettlementInfoConfirm(self, pConfirm: Any, pRspInfo: Any, nRequestID: int, bIsLast: bool) -> None:
+            if pRspInfo is not None and pRspInfo.ErrorID != 0:
+                logger.error("[ctp-worker-td] 结算单确认失败 %s: %s", pRspInfo.ErrorID, pRspInfo.ErrorMsg)
+                return
+            logger.info("[ctp-worker-td] 结算单已确认")
+            q.put(
+                {
+                    "type": READY,
+                    "front_id": _CMD_STATE["front_id"],
+                    "session_id": _CMD_STATE["session_id"],
+                }
+            )
+
+        def OnRtnOrder(self, pOrder: Any) -> None:
+            q.put({"type": ORDER, "data": _snapshot(pOrder, _ORDER_FIELDS)})
+
+        def OnRtnTrade(self, pTrade: Any) -> None:
+            q.put({"type": TRADE, "data": _snapshot(pTrade, _TRADE_FIELDS)})
+
+        def OnRspQryTradingAccount(self, pAccount: Any, pRspInfo: Any, nRequestID: int, bIsLast: bool) -> None:
+            if pAccount is not None:
+                q.put({"type": ACCOUNT, "data": _snapshot(pAccount, _ACCOUNT_FIELDS)})
+
+        def OnRspQryInvestorPosition(self, pPosition: Any, pRspInfo: Any, nRequestID: int, bIsLast: bool) -> None:
+            if pPosition is not None:
+                q.put({"type": POSITION, "data": _snapshot(pPosition, _POSITION_FIELDS)})
+
+        def OnFrontDisconnected(self, nReason: int) -> None:
+            logger.warning("[ctp-worker-td] 连接断开 reason=%s", nReason)
+            q.put({"type": DISCONNECTED, "reason": int(nReason)})
+
+    api = CThostFtdcTraderApi.CreateFtdcTraderApi(config.flow_path("flow_td"))
+    spi = _TdSpi()  # 持引用
+    api.RegisterSpi(spi)
+    api.RegisterFront(config.trade_front)
+    api.SubscribePrivateTopic(2)
+    api.SubscribePublicTopic(2)
+    api.Init()
+    logger.info("[ctp-worker-td] 已启动")
+
+    deadline = time.time() + lifetime if lifetime else None
+    try:
+        while True:
+            if deadline is not None and time.time() >= deadline:
+                logger.info("[ctp-worker-td] 存活期到，主动退出")
+                break
+            try:
+                cmd = cmd_q.get_nowait()
+            except Empty:
+                time.sleep(0.05)
+                continue
+            _handle_cmd(api, cmd, order_field, action_field, acct_field, pos_field)
+    finally:
+        api.Release()
+        logger.info("[ctp-worker-td] 已退出")
+
+
 def run_ctp_worker(
     q: Any,
+    cmd_q: Any,
     config: Any,
     contracts: list[str],
     lifetime: float | None = None,
+    mode: str = "md",
 ) -> None:
     """子进程入口（模块级函数，spawn 可 pickle）。
 
-    q：multiprocessing.Queue，向父进程推送 {"type": ..., ...}
-    config：CtpConfig（可 pickle）
-    contracts：订阅合约列表（合约代码，如 rb2701）
-    lifetime：存活秒数（None=常驻）；到期主动退出，父进程重启即内存重置
+    q：子→父队列；cmd_q：父→子指令队列（td 模式用）
+    mode："md"=行情，"td"=交易（认证链 + 指令循环）
     """
     import gc
 
     gc.disable()  # 约束 1
+
+    if mode == "td":
+        _run_td(q, cmd_q, config, lifetime)
+        return
+    _run_md(q, config, contracts, lifetime)
+
+
+def _run_md(q: Any, config: Any, contracts: list[str], lifetime: float | None) -> None:
 
     from openctp_ctp.thostmduserapi import (
         CThostFtdcMdApi,

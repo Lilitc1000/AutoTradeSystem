@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 import logging
 import multiprocessing
 import threading
@@ -33,7 +32,7 @@ from ...domain.model.instrument import Instrument
 from ...domain.model.order import Order, OrderStatus, PriceType
 from ..bar_aggregator import BarAggregator
 from . import mapping
-from .worker import DISCONNECTED, READY, TICK, run_ctp_worker
+from .worker import ACCOUNT, DISCONNECTED, ORDER, POSITION, READY, TICK, TRADE, run_ctp_worker
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +214,7 @@ class CtpMarketData(MarketDataPort):
             self._mp_queue = ctx.Queue()
         self._worker = ctx.Process(
             target=run_ctp_worker,
-            args=(self._mp_queue, self.config, list(self._subscribed), self._worker_lifetime),
+            args=(self._mp_queue, None, self.config, list(self._subscribed), self._worker_lifetime, "md"),
             name="ctp-md-worker",
             daemon=True,
         )
@@ -435,11 +434,21 @@ class CtpTradeGateway(OrderPort):
         self._balance: Decimal = Decimal("0")
         self._positions: list[Any] = []
         self._account_waiter = threading.Event()
+        self._deferred: list[dict[str, Any]] = []  # balance 同步轮询时缓存的回报
+        # ---- CTP worker 子进程（崩溃隔离，见 worker.py）----
+        self._mp_queue: Any = None  # 子→父（回报）
+        self._cmd_queue: Any = None  # 父→子（指令）
+        self._worker: Any = None
+        self._supervisor: asyncio.Task[None] | None = None
+        self._worker_lifetime: float | None = None
+        self._restart_count = 0
+        self._stopping = False
 
     # ---- OrderPort ----
 
     def submit(self, command: OrderCommand) -> Order:
-        if self._api is None or not self._ready.is_set():
+        # api 在 worker 子进程内，就绪判据是 worker + READY
+        if self._worker is None or not self._ready.is_set():
             raise RuntimeError("交易会话未就绪，请先 await start()")
         order = Order(
             order_id=f"{command.instance_id}-{command.idempotency_key}",
@@ -465,10 +474,14 @@ class CtpTradeGateway(OrderPort):
         values.setdefault("OrderRef", order.order_id[-12:])
         if command.price_type is PriceType.MARKET:
             values["LimitPrice"] = Decimal("0")
-        field = _to_field(values, trade.CThostFtdcInputOrderField)
-        self._request_id += 1
-        self._api.ReqOrderInsert(field, self._request_id)
+        # 指令经队列下发到 worker 子进程（CTP 调用不在父进程）
+        self._send_cmd("submit", values)
         return order
+
+    def _send_cmd(self, action: str, values: dict[str, Any]) -> None:
+        if self._cmd_queue is None:
+            raise RuntimeError("交易 worker 未启动，请先 await start()")
+        self._cmd_queue.put({"action": action, "values": values})
 
     def cancel(self, order_id: str) -> Order:
         order = self._orders.get(order_id)
@@ -488,7 +501,7 @@ class CtpTradeGateway(OrderPort):
             "SessionID": self._session_id,
         }
         self._request_id += 1
-        self._api.ReqOrderAction(_to_field(values, trade.CThostFtdcInputOrderActionField), self._request_id)
+        self._send_cmd("cancel", values)
         return order
 
     def query(self, order_id: str) -> Order | None:
@@ -497,21 +510,60 @@ class CtpTradeGateway(OrderPort):
     # ---- 生命周期 ----
 
     async def start(self) -> None:
-        # SWIG + GC segfault 约束：禁用 GC（同 CtpMarketData.create，见其 docstring）
-        gc.disable()
-        _md, trade = _load_ctp()
-        self._api = trade.CThostFtdcTraderApi.CreateFtdcTraderApi(self.config.flow_path("flow_td"))
-        self._spi = self._make_spi(trade.CThostFtdcTraderSpi)
-        self._api.RegisterSpi(self._spi)
-        self._api.RegisterFront(self.config.trade_front)
-        self._api.SubscribePrivateTopic(2)  # 1=只推登录后的流
-        self._api.SubscribePublicTopic(2)
-        self._api.Init()
-        await asyncio.to_thread(self._ready.wait, 20)
+        """启动交易 worker 子进程（崩溃隔离，同 CtpMarketData）。"""
         self._loop = asyncio.get_running_loop()
+        if self._worker is None:
+            self._start_worker()
+            await asyncio.to_thread(self._drain_until_ready, 20)
         self._consumer = asyncio.create_task(self._consume())
+        self._supervisor = asyncio.create_task(self._supervise())
+
+    def _start_worker(self) -> None:
+        """启动（或重启）交易 worker 子进程。"""
+        ctx = multiprocessing.get_context("spawn")
+        if self._mp_queue is None:
+            self._mp_queue = ctx.Queue()
+        if self._cmd_queue is None:
+            self._cmd_queue = ctx.Queue()
+        self._worker = ctx.Process(
+            target=run_ctp_worker,
+            args=(self._mp_queue, self._cmd_queue, self.config, [], self._worker_lifetime, "td"),
+            name="ctp-td-worker",
+            daemon=True,
+        )
+        self._worker.start()
+        logger.info("CTP 交易 worker 子进程启动 pid=%s", self._worker.pid)
+
+    def _drain_until_ready(self, timeout: float) -> None:
+        """同步等 worker 的 READY（结算单确认完成）消息。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self._ready.is_set():
+            try:
+                item = self._mp_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            if isinstance(item, dict) and item.get("type") == READY:
+                self._front_id = int(item.get("front_id", 0))
+                self._session_id = int(item.get("session_id", 0))
+                self._ready.set()
+                return
+
+    async def _supervise(self) -> None:
+        """worker 崩溃/退出 → 重启。"""
+        while True:
+            await asyncio.sleep(2)
+            if self._stopping or self._worker is None:
+                continue
+            if not self._worker.is_alive():
+                self._restart_count += 1
+                logger.warning(
+                    "CTP 交易 worker 退出（exitcode=%s），第 %d 次重启", self._worker.exitcode, self._restart_count
+                )
+                self._ready.clear()
+                self._start_worker()
 
     async def stop(self) -> None:
+        self._stopping = True
         if self._consumer is not None:
             self._queue.put_nowait(None)
             try:
@@ -519,43 +571,59 @@ class CtpTradeGateway(OrderPort):
             except (TimeoutError, asyncio.CancelledError):  # noqa: UP041
                 self._consumer.cancel()
             self._consumer = None
-        if self._api is not None:
-            self._api.Release()
-            self._api = None
+        if self._supervisor is not None:
+            self._supervisor.cancel()
+            self._supervisor = None
+        if self._worker is not None and self._worker.is_alive():
+            logger.info("终止 CTP 交易 worker pid=%s", self._worker.pid)
+            self._worker.terminate()
+            self._worker.join(timeout=5)
+        self._worker = None
 
     # ---- 账户查询（AccountPort 由 CtpAccount 代理到此）----
 
     def balance_snapshot(self) -> Money:
-        """查询可用资金（同步等回调，10 秒超时）。"""
-        if self._api is None or not self._ready.is_set():
+        """查询可用资金（同步轮询，10 秒超时）。
+
+        balance 是 AccountPort 的同步接口——不能依赖 _consume 协程处理回报
+        （同步等待会阻塞事件循环）。故这里同步 drain 队列；遇到的非资金回报
+        存入 _deferred，由 _consume 后续处理（不丢回报）。
+        """
+        if self._worker is None or not self._ready.is_set():
             raise RuntimeError("交易会话未就绪")
-        _md, trade = _load_ctp()
-        self._account_waiter = threading.Event()
-        self._api.ReqQryTradingAccount(
-            _to_field(
-                {"BrokerID": self.config.broker_id, "InvestorID": self.config.user_id},
-                trade.CThostFtdcQryTradingAccountField,
-            ),
-            self._next_request_id(),
-        )
-        self._account_waiter.wait(timeout=10)
+        self._send_cmd("query_account", {})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                item = self._mp_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == ACCOUNT:
+                self._balance = Decimal(str((item.get("data") or {}).get("Available", "0")))
+                return Money(self._balance)
+            self._deferred.append(item)  # 委托/成交回报延后处理，不丢
         return Money(self._balance)
 
     def position_snapshot(self) -> list[Any]:
-        """查询持仓（同步等回调）。"""
-        if self._api is None or not self._ready.is_set():
+        """查询持仓（同步轮询，10 秒超时；同 balance_snapshot 的理由）。"""
+        if self._worker is None or not self._ready.is_set():
             raise RuntimeError("交易会话未就绪")
-        _md, trade = _load_ctp()
-        self._account_waiter = threading.Event()
         self._positions = []
-        self._api.ReqQryInvestorPosition(
-            _to_field(
-                {"BrokerID": self.config.broker_id, "InvestorID": self.config.user_id},
-                trade.CThostFtdcQryInvestorPositionField,
-            ),
-            self._next_request_id(),
-        )
-        self._account_waiter.wait(timeout=10)
+        self._send_cmd("query_position", {})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                item = self._mp_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == POSITION:
+                self._positions.append(item.get("data") or {})
+                continue
+            self._deferred.append(item)  # 其他回报延后处理
         return list(self._positions)
 
     def _next_request_id(self) -> int:
@@ -728,11 +796,82 @@ class CtpTradeGateway(OrderPort):
             return
 
     async def _consume(self) -> None:
+        """父进程侧：处理 worker 回报（委托/成交/资金）+ 发布 fill。
+
+        用协程轮询（同 CtpMarketData），避免阻塞线程挂住事件循环。
+        """
+        assert self._mp_queue is not None
         while True:
-            payload = await self._queue.get()
-            if payload is None:
-                return
-            await self.bus.publish("trade.fill", payload)
+            # 先处理 balance 同步轮询时缓存的回报（不丢消息）
+            while self._deferred:
+                await self._handle_report(self._deferred.pop(0))
+            try:
+                item = self._mp_queue.get_nowait()
+            except Empty:
+                try:
+                    inner = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.05)
+                    continue
+                if inner is None:
+                    return
+                await self.bus.publish("trade.fill", inner)
+                continue
+            if isinstance(item, dict):
+                await self._handle_report(item)
+
+    async def _handle_report(self, item: dict[str, Any]) -> None:
+        """分发 worker 上报消息。"""
+        kind = item.get("type")
+        if kind == ORDER:
+            self._on_order(item.get("data") or {})
+        elif kind == TRADE:
+            await self._on_trade(item.get("data") or {})
+        elif kind == ACCOUNT:
+            self._on_account(item.get("data") or {})
+        elif kind == READY:
+            self._ready.set()
+
+    def _on_order(self, payload: dict[str, Any]) -> None:
+        """委托回报 → 域订单状态机（原在 spi 回调线程内，现移到父进程）。"""
+        order = self._match_order(str(payload.get("OrderRef", "")))
+        if order is None:
+            return
+        status = mapping.ctp_to_order_status(
+            str(payload.get("OrderStatus", "")), str(payload.get("OrderSubmitStatus", "0"))
+        )
+        if status is OrderStatus.SUBMITTED and order.status is OrderStatus.PENDING:
+            order.submit()
+        elif status is OrderStatus.CANCELLED and not order.is_final:
+            order.cancel()
+        elif status is OrderStatus.REJECTED and not order.is_final:
+            order.reject(str(payload.get("StatusMsg", "")))
+
+    async def _on_trade(self, payload: dict[str, Any]) -> None:
+        """成交回报 → 域订单部分成交 + fill 发布。"""
+        fill = mapping.ctp_trade_to_fill(payload)
+        order = self._match_order(str(fill.get("order_ref", "")))
+        if order is None:
+            return
+        qty = Decimal(str(fill.get("quantity", "0")))
+        price = Decimal(str(fill.get("price", "0")))
+        if qty > 0:
+            order.partial_fill(Quantity(qty), price)
+        await self.bus.publish(
+            "trade.fill",
+            {
+                "order_id": order.order_id,
+                "status": str(order.status),
+                "filled_quantity": str(order.filled_quantity),
+                "avg_fill_price": str(order.avg_fill_price),
+                **fill,
+            },
+        )
+
+    def _on_account(self, payload: dict[str, Any]) -> None:
+        """资金快照回报（balance_snapshot 等待它）。"""
+        self._balance = Decimal(str(payload.get("Available", "0")))
+        self._account_waiter.set()
 
 
 class CtpAccount(AccountPort):

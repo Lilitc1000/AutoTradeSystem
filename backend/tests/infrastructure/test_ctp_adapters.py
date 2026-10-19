@@ -260,21 +260,50 @@ def _install_fake_mp(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(A.multiprocessing, "get_context", lambda _name: _FakeCtx())
 
 
-def _fake_worker(q: Any, config: Any, contracts: list[str], lifetime: float | None = None) -> None:
-    """Fake worker：把预设消息塞进队列（记录调用参数）。"""
-    _fake_worker.calls.append((list(contracts), lifetime))  # type: ignore[attr-defined]
+def _fake_worker(  # noqa: PLR0913 - 对齐真 worker 签名
+    q: Any,
+    cmd_q: Any,
+    config: Any,
+    contracts: list[str],
+    lifetime: float | None = None,
+    mode: str = "md",
+) -> None:
+    """Fake CTP worker：塞预设回报 + 记录父进程下发的指令。"""
+    _fake_worker.calls.append((list(contracts), lifetime, mode))  # type: ignore[attr-defined]
     for item in _fake_worker.queue_put:  # type: ignore[attr-defined]
         q.put(item)
     if _fake_worker.exit_immediately:  # type: ignore[attr-defined]
-        return  # 模拟崩溃退出
+        return  # 模拟崩溃
+    import queue as _q
     import time as _time
 
-    _time.sleep(30)
+    deadline = _time.time() + 30
+    while _time.time() < deadline:
+        try:
+            cmd = cmd_q.get_nowait()
+        except _q.Empty:
+            _time.sleep(0.02)
+            continue
+        _fake_worker.commands.append(cmd)  # type: ignore[attr-defined]
+        # 按需触发预设回报（submit → 委托/成交回报）
+        for item in _fake_worker.reply_on_cmd:  # type: ignore[attr-defined]
+            q.put(item)
 
 
 _fake_worker.calls = []  # type: ignore[attr-defined]
 _fake_worker.queue_put = []  # type: ignore[attr-defined]
+_fake_worker.commands = []  # type: ignore[attr-defined]
+_fake_worker.reply_on_cmd = []  # type: ignore[attr-defined]
 _fake_worker.exit_immediately = False  # type: ignore[attr-defined]
+
+
+def _reset_fake_worker(queue_put: list[dict[str, Any]]) -> None:
+    """重置 Fake worker 状态（每个用例前调用）。"""
+    _fake_worker.calls.clear()  # type: ignore[attr-defined]
+    _fake_worker.commands.clear()  # type: ignore[attr-defined]
+    _fake_worker.reply_on_cmd = []  # type: ignore[attr-defined]
+    _fake_worker.queue_put = queue_put  # type: ignore[attr-defined]
+    _fake_worker.exit_immediately = False  # type: ignore[attr-defined]
 
 
 def _depth_dict(symbol: str, time_str: str, last: str) -> dict[str, Any]:
@@ -323,8 +352,9 @@ class TestCtpMarketData:
         md.subscribe(["rb"])
         await md.start()
         assert _fake_worker.calls, "应启动 CTP worker"
-        contracts, _lifetime = _fake_worker.calls[0]
+        contracts, _lifetime, _mode = _fake_worker.calls[0]
         assert contracts == ["rb"]
+        assert _mode == "md"
         assert md._ready.is_set()  # noqa: SLF001  # READY 消息后置位
         await md.stop()
 
@@ -381,30 +411,52 @@ class TestCtpMarketData:
 
 
 class TestCtpTradeGateway:
-    async def test_start_runs_authenticate_then_login(self) -> None:
+    async def test_start_spawns_td_worker_and_waits_ready(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """交易侧：起 td worker 子进程（认证链在 worker 内），等 READY 置位。"""
+        _install_fake_mp(monkeypatch)
+        _reset_fake_worker([{"type": A.READY, "front_id": 1, "session_id": 2}])
+        monkeypatch.setattr(A, "run_ctp_worker", _fake_worker)
         gw = A.CtpTradeGateway(A.CtpConfig(), FakeBus())
         await gw.start()
-        api = FakeTdApi.instances[0]
-        names = [c[0] for c in api.calls]
-        assert names.index("ReqAuthenticate") < names.index("ReqUserLogin")
+        assert _fake_worker.calls, "应启动交易 worker"
+        _contracts, _lifetime, mode = _fake_worker.calls[0]
+        assert mode == "td"
+        assert gw._ready.is_set()  # noqa: SLF001
+        assert gw._front_id == 1 and gw._session_id == 2  # noqa: SLF001  # 撤单定位
         await gw.stop()
 
-    async def test_submit_calls_req_order_insert_and_returns_pending(self) -> None:
+    async def test_submit_sends_cmd_to_worker_and_returns_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """发单：指令经队列下发 worker（CTP 调用不在父进程）。"""
+        _install_fake_mp(monkeypatch)
+        _reset_fake_worker([{"type": A.READY, "front_id": 1, "session_id": 2}])
+        monkeypatch.setattr(A, "run_ctp_worker", _fake_worker)
         bus = FakeBus()
         gw = A.CtpTradeGateway(A.CtpConfig(), bus)
         await gw.start()
         order = gw.submit(_command())
         assert order.status is OrderStatus.PENDING
-        api = FakeTdApi.instances[0]
-        inserts = [c for c in api.calls if c[0] == "ReqOrderInsert"]
+        # worker 侧轮询收指令，等它被 Fake worker 取走
+        import asyncio
+
+        for _ in range(50):
+            if _fake_worker.commands:
+                break
+            await asyncio.sleep(0.02)
+        inserts = [c for c in _fake_worker.commands if c.get("action") == "submit"]
         assert len(inserts) == 1
-        field = inserts[0][1]
-        assert field.BrokerID == "9999"
-        assert field.InstrumentID == "rb2601"
+        values = inserts[0]["values"]
+        assert values["BrokerID"] == "9999"
+        assert values["InstrumentID"] == "rb2601"
+        assert values["OrderPriceType"] == "2"  # 限价（编码反直觉）
         assert gw.query(order.order_id) is order
         await gw.stop()
 
-    async def test_rtn_trade_fills_order_and_publishes_fill(self) -> None:
+    async def test_rtn_trade_fills_order_and_publishes_fill(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_fake_mp(monkeypatch)
+        _reset_fake_worker([{"type": A.READY, "front_id": 1, "session_id": 2}])
+        monkeypatch.setattr(A, "run_ctp_worker", _fake_worker)
         bus = FakeBus()
         gw = A.CtpTradeGateway(A.CtpConfig(), bus)
         await gw.start()
@@ -420,9 +472,13 @@ class TestCtpTradeGateway:
         ack.OrderStatus = "2"
         ack.OrderSubmitStatus = "0"
         ack.StatusMsg = ""
-        gw._spi.OnRtnOrder(ack)  # noqa: SLF001
+        gw._on_order(  # noqa: SLF001  # 父进程侧回报处理（worker 上报）
+            {"OrderRef": ack.OrderRef, "OrderStatus": "2", "OrderSubmitStatus": "0", "StatusMsg": ""}
+        )
         assert order.status is OrderStatus.SUBMITTED
-        gw._spi.OnRtnTrade(trade)  # noqa: SLF001
+        await gw._on_trade(  # noqa: SLF001
+            {"OrderRef": trade.OrderRef, "InstrumentID": "rb2601", "Volume": "2", "Price": "3456.5"}
+        )
         assert order.status is OrderStatus.FILLED
         assert Decimal(order.avg_fill_price) == Decimal("3456.5")
         import asyncio
@@ -444,7 +500,12 @@ class TestCtpTradeGateway:
 
 
 class TestCtpAccount:
-    async def test_balance_and_positions_via_gateway(self) -> None:
+    async def test_balance_and_positions_via_gateway(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_fake_mp(monkeypatch)
+        # worker 收到 query_account 指令后回复资金快照
+        _reset_fake_worker([{"type": A.READY, "front_id": 1, "session_id": 2}])
+        _fake_worker.reply_on_cmd = [{"type": A.ACCOUNT, "data": {"Available": "123456.78"}}]
+        monkeypatch.setattr(A, "run_ctp_worker", _fake_worker)
         gw = A.CtpTradeGateway(A.CtpConfig(), FakeBus())
         await gw.start()
         account = A.CtpAccount(gw)
