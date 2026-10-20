@@ -23,7 +23,9 @@ from ..infrastructure.persistence.models import TradeAccount
 # 连接测试等待上限（秒）——与 CtpTradeGateway._drain_until_ready 一致
 _TEST_TIMEOUT = 25
 _TEST_LIFETIME = 40  # worker 存活上限（兜底自杀）
-_RETRY_DELAY = 8  # SIGSEGV 后等会话释放再重试（秒）
+_RETRY_DELAY = 60  # SIGSEGV 后等会话释放再重试（秒）——柜台侧会话注销约 1-2 分钟
+_PROBE_COOLDOWN = 60  # 两次探测之间的最小间隔（CTP 会话释放窗口，柜台侧 1-2 分钟）
+_LAST_PROBE_END = 0.0  # 上次探测结束时刻（进程内节流）
 
 
 @asynccontextmanager
@@ -184,10 +186,20 @@ class AccountService:
         return {"ok": ok, "msg": msg}
 
     async def _probe_once(self, account_id: int) -> tuple[bool, str, Any]:
-        """单次探测：起 worker → 等 READY → 收尾。返回 (ok, msg, worker)。"""
+        """单次探测：起 worker → 等 READY → 收尾。返回 (ok, msg, worker)。
+
+        探测前先过冷却窗口：CTP 会话在 worker 退出后仍需一段时间才在
+        柜台侧释放（崩溃时更是没有 Release，要等超时）——紧接着起新
+        worker 会撞上旧会话并 SIGSEGV。
+        """
+        global _LAST_PROBE_END  # noqa: PLW0603 - 进程内节流标记
         import multiprocessing
         import queue as _queue
         import time
+
+        wait = _PROBE_COOLDOWN - (time.monotonic() - _LAST_PROBE_END)
+        if wait > 0:
+            await asyncio.sleep(wait)
 
         async with _session() as session:
             row = await session.get(TradeAccount, account_id)
@@ -238,9 +250,11 @@ class AccountService:
         finally:
             if worker.is_alive():
                 worker.terminate()
-                worker.join(timeout=5)
+                # Release() 需要网络往返——给足时间，否则会话非优雅关闭
+                worker.join(timeout=15)
             else:
-                worker.join(timeout=1)  # 回收僵尸，确保会话释放
+                worker.join(timeout=1)  # 回收僵尸
+            _LAST_PROBE_END = time.monotonic()
         return ok, msg, worker
 
 

@@ -130,6 +130,7 @@ onMounted(refresh);
             </n-space>
             <n-space>
               <n-button size="small" :loading="testing === row.id" @click="test(row)">连接测试</n-button>
+              <span class="dim" v-if="row.last_test_ok === false">上次失败：CTP 会话释放中，约 1 分钟后再试</span>
               <n-button v-if="!row.is_active" size="small" type="primary" ghost @click="activate(row)">设为使用</n-button>
               <n-button size="small" @click="openEdit(row)">编辑</n-button>
               <n-button size="small" type="error" ghost @click="remove(row)">删除</n-button>
