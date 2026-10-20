@@ -166,6 +166,32 @@ services:
       - "0.0.0.0"
       - "--port"
       - "8673"
+
+  trade_gateway:
+    # M3-e2 交易出口：订阅 trade.order 统一执行（单 CTP td 连接）。
+    # profile 隔离——默认不起：strategy_core SIM 模式当前直连 CTP，
+    # 两者同开会撞 SimNow 并发限制。e2b（策略改发总线）完成后启用：
+    #   docker compose --profile trade up -d trade_gateway
+    image: devcontainer-app:latest
+    profiles: ["trade"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      - PYTHONPATH=src
+      - DATABASE_URL=postgresql+asyncpg://autotrade:${POSTGRES_PASSWORD}@db:5432/autotrade
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+    working_dir: /workspace/backend
+    volumes:
+      - ..:/workspace:delegated
+    command:
+      - "python3"
+      - "-m"
+      - "futures_trading.processes.trade_gateway"
+      - "--symbols"
+      - "rb"
 volumes:
   postgres_data:
   redis_data:

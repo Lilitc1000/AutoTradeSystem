@@ -21,7 +21,14 @@ from ...common.settings import settings
 router = APIRouter(prefix="/api/stream", tags=["stream"])
 
 # 允许订阅的频道前缀（与 message_bus 协议对应）
-_ALLOWED_PREFIXES = ("md.bar.", "md.tick.", "signal.outcome", "trade.fill", "heartbeat:")
+_ALLOWED_PREFIXES = (
+    "md.bar.",
+    "md.tick.",
+    "signal.outcome",
+    "trade.fill",
+    "trade.order.status",  # M3-e2 执行结果回报（手动/自动单追踪）
+    "heartbeat:",
+)
 
 # 心跳保活间隔（秒）——SSE 经代理时需要定期注释行防断开
 _KEEPALIVE_SECONDS = 15

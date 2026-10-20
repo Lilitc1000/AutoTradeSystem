@@ -131,9 +131,9 @@ async def worker_heartbeat() -> dict[str, object]:
     prefix = settings.redis_key_prefix
     client = redis.from_url(settings.redis_url, decode_responses=True)
     try:
-        # trade_gateway 不设独立进程（交易在 strategy_core SIM 模式内），
-        # 列它会永远显示离线——误导
-        names = ("md_gateway", "strategy_core")
+        # M3-e2 起 trade_gateway 成为独立进程（交易出口）——重新纳入监控；
+        # 未启用该服务时显示离线属正常
+        names = ("md_gateway", "strategy_core", "trade_gateway")
         beats: dict[str, object] = {}
         for name in names:
             ts = await client.get(f"{prefix}:proc:{name}:hb")
