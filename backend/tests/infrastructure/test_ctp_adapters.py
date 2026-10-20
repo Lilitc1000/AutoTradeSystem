@@ -279,6 +279,9 @@ def _fake_worker(  # noqa: PLR0913 - 对齐真 worker 签名
 
     deadline = _time.time() + 30
     while _time.time() < deadline:
+        if cmd_q is None:
+            _time.sleep(0.05)  # md 模式无指令队列
+            continue
         try:
             cmd = cmd_q.get_nowait()
         except _q.Empty:

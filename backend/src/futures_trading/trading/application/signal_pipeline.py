@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from ...common.types import ZERO, Money, Price, Quantity
-from ..domain.model.instrument import Instrument
+from ..domain.model.instrument import Exchange, Instrument
 from ..domain.model.order import Offset, PriceType
 from ..domain.model.portfolio import Portfolio
 from ..domain.model.signal import Signal
@@ -76,7 +76,7 @@ class SignalPipeline:
             return SignalOutcome(signal, "IGNORED", "组合已持有同向净敞口")
         if net is not None:
             # 组合持有反向净敞口：先平仓（本管线只发平仓指令）
-            return self._emit_close(signal, instrument, portfolio)
+            return self._emit_close(signal, instrument, portfolio, bars)
 
         # ---- 仓位计算（四层取小）----
         instance = portfolio.instances.get(signal.instance_id)
@@ -139,7 +139,10 @@ class SignalPipeline:
             direction=signal.direction,
             offset=Offset.OPEN,
             quantity=Quantity(Decimal(sizing.lots)),
-            price_type=PriceType.MARKET,
+            price_type=PriceType.LIMIT,
+            # SHFE 不支持市价单（错误码 79）——按信号触发 bar 的收盘价报单；
+            # 精确成交由 ExecutionService 追单循环保证（接线后升级）
+            limit_price=_bar_close(bars, contract),
             signal_id=signal.signal_id,
         )
         order = self._orders.submit(command)
@@ -152,27 +155,74 @@ class SignalPipeline:
         )
 
     def _emit_close(
-        self, signal: Signal, instrument: Instrument, portfolio: Portfolio
+        self,
+        signal: Signal,
+        instrument: Instrument,
+        portfolio: Portfolio,
+        bars: dict[str, Bar],
     ) -> SignalOutcome:
-        """平掉组合中该品种的反向净敞口（简化：按全部持仓手数）。"""
-        total_lots = Decimal("0")
+        """平掉组合中该品种的反向净敞口。
+
+        SHFE 特殊：按持仓**今昨构成拆分**报单（平今 '3' + 平昨 '1'）——
+        只用 '1' 平今仓会被柜台以"持仓不足"拒单。非 SHFE 品种用通用
+        Offset.CLOSE。价格：LIMIT @ bar 收盘价（SHFE 不支持市价单，
+        错误码 79；精确成交由 ExecutionService 追单循环保证——接线前
+        的过渡语义：信号基于已收盘 bar，按收盘价报单）。
+        """
+        is_shfe = instrument.exchange is Exchange.SHFE
+        today_lots = Decimal("0")
+        yesterday_lots = Decimal("0")
         for instance in portfolio.instances.values():
             for position in instance.open_positions():
                 if position.contract == instrument.contract:
-                    total_lots += position.quantity
+                    today_lots += position.today_quantity
+                    yesterday_lots += position.yesterday_quantity
+        total_lots = today_lots + yesterday_lots
         if total_lots == ZERO:
             return SignalOutcome(signal, "IGNORED", "无可平持仓")
-        command = OrderCommand(
-            instance_id=signal.instance_id,
-            contract=instrument.contract,
-            symbol=signal.symbol,
-            direction=signal.direction,  # 平仓方向与信号一致（与持仓相反）
-            offset=Offset.CLOSE,
-            quantity=Quantity(total_lots),
-            price_type=PriceType.MARKET,
-            signal_id=signal.signal_id,
-        )
-        order = self._orders.submit(command)
+        close_price = _bar_close(bars, instrument.contract)
+        order_ids: list[str] = []
+        plans: list[tuple[Offset, Decimal]] = []
+        if is_shfe:
+            # 先平今后平昨（今仓是日内主体；平昨单不挤占今仓）
+            if today_lots > ZERO:
+                plans.append((Offset.CLOSE_TODAY, today_lots))
+            if yesterday_lots > ZERO:
+                plans.append((Offset.CLOSE_YESTERDAY, yesterday_lots))
+        else:
+            plans.append((Offset.CLOSE, total_lots))
+        for offset, lots in plans:
+            command = OrderCommand(
+                instance_id=signal.instance_id,
+                contract=instrument.contract,
+                symbol=signal.symbol,
+                direction=signal.direction,  # 平仓方向与信号一致（与持仓相反）
+                offset=offset,
+                quantity=Quantity(lots),
+                price_type=PriceType.LIMIT,
+                limit_price=close_price,
+                signal_id=signal.signal_id,
+            )
+            order = self._orders.submit(command)
+            order_ids.append(order.order_id)
         return SignalOutcome(
-            signal, "EXECUTED", lots=int(total_lots), reason="平掉反向敞口", order_id=order.order_id
+            signal,
+            "EXECUTED",
+            lots=int(total_lots),
+            reason=f"平掉反向敞口（今{today_lots}/昨{yesterday_lots}）",
+            order_id=",".join(order_ids),
         )
+
+
+def _bar_close(bars: dict[str, Bar], contract: str) -> Price | None:
+    """取合约最新 bar 收盘价（报单限价基准）。
+
+    bars 的 key 在不同调用方不一致（shadow/回测传 symbol，实盘可传
+    contract）——两种都尝试。无 bar 返回 None（调用方需保证 bars 新鲜，
+    否则 CTP 会因限价空值拒单）。
+    """
+    bar = bars.get(contract)
+    if bar is None:
+        symbol = "".join(ch for ch in contract if ch.isalpha())
+        bar = bars.get(symbol)
+    return bar.close if bar is not None else None

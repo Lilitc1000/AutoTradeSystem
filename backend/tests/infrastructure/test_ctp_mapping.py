@@ -110,3 +110,13 @@ class TestReportMapping:
         assert Decimal(tick.last_price) == Decimal("3501.0")
         assert Decimal(tick.volume) == Decimal("12345")
         assert tick.ts.tzinfo is None  # CTP 时间是本地无时区
+
+
+class TestOffsetMapping:
+    """SHFE 平今/平昨映射（日盘 10-20 补）。"""
+
+    def test_close_today_and_yesterday_flags(self) -> None:
+        assert mapping.offset_to_ctp(Offset.OPEN) == "0"
+        assert mapping.offset_to_ctp(Offset.CLOSE_TODAY) == "3"  # SHFE 平今
+        assert mapping.offset_to_ctp(Offset.CLOSE_YESTERDAY) == "1"  # SHFE 平昨
+        assert mapping.offset_to_ctp(Offset.CLOSE) == "1"  # 通用平仓

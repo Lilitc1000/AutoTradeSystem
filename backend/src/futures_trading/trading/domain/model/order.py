@@ -20,10 +20,17 @@ from .signal import Direction
 
 
 class Offset(StrEnum):
-    """开平标志。"""
+    """开平标志。
+
+    SHFE（上期所）特殊：平仓必须区分**平今**（'3'）与**平昨**（'1'）——
+    混用/只用其一会被柜台拒单（"持仓不足"）。日内策略的平仓主体是平今，
+    故枚举显式区分，由持仓今昨构成决定拆分（signal_pipeline._emit_close）。
+    """
 
     OPEN = "OPEN"
-    CLOSE = "CLOSE"
+    CLOSE = "CLOSE"  # 通用平仓（非 SHFE 交易所/不区分今昔的简化路径）
+    CLOSE_TODAY = "CLOSE_TODAY"  # SHFE 平今
+    CLOSE_YESTERDAY = "CLOSE_YESTERDAY"  # SHFE 平昨
 
 
 class PriceType(StrEnum):

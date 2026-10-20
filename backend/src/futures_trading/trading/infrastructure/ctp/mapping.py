@@ -25,8 +25,17 @@ def direction_to_ctp(direction: Direction) -> str:
 
 
 def offset_to_ctp(offset: Offset) -> str:
-    """域开平 → CTP 开平标志字符（'0'=开 '1'=平，简化：不区分今昨，M2-b 联调时完善）。"""
-    return "0" if offset is Offset.OPEN else "1"
+    """域开平 → CTP 开平标志字符。
+
+    CTP CombOffsetFlag：'0'=开仓 '1'=平昨 '3'=平今（SHFE 专用）。
+    SHFE 平仓不区分今昔会被拒（"持仓不足"）——signal_pipeline 按持仓
+    今昨构成拆分报单，故这里支持三种平仓。
+    """
+    if offset is Offset.OPEN:
+        return "0"
+    if offset is Offset.CLOSE_TODAY:
+        return "3"
+    return "1"  # CLOSE / CLOSE_YESTERDAY
 
 
 def price_type_to_ctp(price_type: PriceType) -> str:

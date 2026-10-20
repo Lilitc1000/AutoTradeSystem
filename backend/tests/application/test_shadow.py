@@ -104,6 +104,6 @@ class TestShadowEngine:
             for outcome in engine.on_bar(bar):
                 if outcome.status == "EXECUTED":
                     assert outcome.lots > 0
-                    if outcome.reason != "平掉反向敞口":
+                    if not (outcome.reason or "").startswith("平掉反向敞口"):
                         # 开仓路径必记录约束层；平仓路径不经仓位计算
                         assert outcome.binding_layer in {"L1", "L2", "L3", "L4"}
