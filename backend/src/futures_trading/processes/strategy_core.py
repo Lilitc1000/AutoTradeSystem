@@ -21,10 +21,11 @@ import redis.asyncio as redis
 from ..common.instrument_registry import get_instrument
 from ..common.settings import settings
 from ..common.types import Price, Quantity
-from ..trading.application.dtos import Bar, Tick
-from ..trading.application.ports import OrderPort
+from ..trading.application.dtos import Bar
 from ..trading.application.shadow import ShadowConfig, ShadowEngine
+from ..trading.domain.model.order import Direction, Offset
 from ..trading.infrastructure.messaging.bus import MessageBus
+from ..trading.infrastructure.messaging.bus_order_port import BusOrderPort, command_to_payload
 from .base import ProcessBase
 
 
@@ -76,48 +77,25 @@ async def run_shadow(symbols: list[str], config: ShadowConfig, mode: str = "shad
     - 订阅 trade.fill：把柜台成交应用到持仓（apply_fill）
     """
     instruments = {s: get_instrument(s) for s in symbols}
-    gateway = None
-    account = None
-    latest_bars: dict[str, Bar] = {}  # 执行器定价基准（最新 bar 收盘价）
+    # M3-e2b：sim 模式不再自持 CTP 连接——指令经 Redis trade.order 发往
+    # trade_gateway（单一交易出口）。避免与出口进程双 td 连接撞 SimNow
+    # 并发限制，且策略崩溃不再影响挂单/持仓状态（7×24 分层）。
+    bus_port: BusOrderPort | None = None
     if mode == "sim":
-        from ..trading.infrastructure.ctp.adapters import (  # noqa: PLC0415 - 懒加载（Linux C++ 扩展）
-            CtpAccount,
-            CtpConfig,
-            CtpTradeGateway,
-        )
-
-        gateway = CtpTradeGateway(CtpConfig.from_settings(), MessageBus(), instruments)
-        await gateway.start()
-        account = CtpAccount(gateway)
-        # 执行器接线：策略层的 MARKET/LIMIT 语义由 ExecutionService 翻译为
-        # "对手价±N tick 限价 + 未成交撤单重发"（SHFE 无市价单——错误码 79）。
-        # 鸭子类型实现 OrderPort，ShadowEngine/pipeline 零改动。
-        from ..trading.application.execution import ExecutionService  # noqa: PLC0415
-
-        def _tick_provider(contract: str) -> Tick | None:
-            bar = latest_bars.get(contract)
-            if bar is None:
-                symbol = "".join(ch for ch in contract if ch.isalpha())
-                bar = latest_bars.get(symbol)
-            if bar is None:
-                return None
-            return Tick(symbol=contract, ts=bar.ts, last_price=bar.close)
-
-        executor: OrderPort | None = ExecutionService(gateway, _tick_provider, instruments)
-    else:
-        executor = None
-
-    engine = ShadowEngine(config, instruments, order_port=executor, external_fills=(mode == "sim"))
+        bus_port = BusOrderPort()
+    engine = ShadowEngine(config, instruments, order_port=bus_port, external_fills=(mode == "sim"))
     bus = MessageBus()
     print(f"[strategy_core] {mode} 实例 {config.instance_id} 就绪，订阅 {len(symbols)} 个品种", flush=True)
     bar_count = 0
     outcome_count = 0
     heartbeat_task = asyncio.create_task(_heartbeat())
-    fill_task = asyncio.create_task(_consume_fills(engine, gateway, bus)) if mode == "sim" else None
+    fill_task = asyncio.create_task(_consume_fills(engine, bus)) if mode == "sim" else None
+    drain_task = (
+        asyncio.create_task(_drain_orders(bus_port, bus)) if bus_port is not None else None
+    )
     try:
         async for _channel, payload in bus.subscribe(*[f"md.bar.{s}" for s in symbols]):
             bar = _payload_to_bar(payload)
-            latest_bars[bar.symbol] = bar
             results = engine.on_bar(bar)
             bar_count += 1
             for outcome in results:
@@ -141,8 +119,8 @@ async def run_shadow(symbols: list[str], config: ShadowConfig, mode: str = "shad
                     flush=True,
                 )
             # SIM 模式：按柜台资金快照更新权益（持仓由 fill 消费协程应用）
-            if mode == "sim" and account is not None and bar_count % 10 == 0:
-                engine.set_equity(Decimal(account.balance()))
+            # M3-e2b：CtpAccount 依赖本地 gateway——已移除；
+            # 权益更新改由 trade_gateway 的资金回报/DB 侧提供（TODO: M3-e3）
 
             if bar_count % 50 == 0:
                 print(
@@ -154,20 +132,61 @@ async def run_shadow(symbols: list[str], config: ShadowConfig, mode: str = "shad
         heartbeat_task.cancel()
         if fill_task is not None:
             fill_task.cancel()
-        if gateway is not None:
-            await gateway.stop()
+        if drain_task is not None:
+            drain_task.cancel()
         await bus.close()
 
 
-async def _consume_fills(engine: ShadowEngine, gateway: object, bus: MessageBus) -> None:
-    """SIM 模式：消费 trade.fill（柜台成交回报）→ 应用到持仓。"""
+async def _consume_fills(engine: ShadowEngine, bus: MessageBus) -> None:
+    """SIM 模式：消费 trade.fill（trade_gateway 广播）→ 应用到持仓。
+
+    M3-e2b：订单状态在 trade_gateway 侧（本地无 gateway.query）——直接
+    用 fill payload 还原成轻量订单对象（字段与 adapters._on_trade 发布
+    的一致）。
+    """
     async for _channel, payload in bus.subscribe("trade.fill"):
         order_id = str(payload.get("order_id", ""))
-        query = getattr(gateway, "query", None)
-        order = query(order_id) if callable(query) else None
+        order = _fill_payload_to_order(payload)
         if order is not None:
             engine.apply_fill(order)
             print(f"[strategy_core] 成交应用 {order_id} {order.status}", flush=True)
+
+
+class _FillOrder:
+    """成交回报还原的轻量订单（仅 _apply_fills 需要的字段）。"""
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.contract = str(payload.get("contract", ""))
+        self.symbol = "".join(ch for ch in self.contract if not ch.isdigit())
+        self.direction = Direction(str(payload.get("direction", "LONG")))
+        self.offset = Offset(str(payload.get("offset", "OPEN")))
+        self.filled_quantity = int(Decimal(str(payload.get("filled_quantity", payload.get("quantity", "0")))))
+        avg = payload.get("avg_fill_price")
+        self.avg_fill_price = Decimal(str(avg)) if avg else None
+        self.status = str(payload.get("status", ""))
+
+
+def _fill_payload_to_order(payload: dict[str, object]) -> _FillOrder | None:
+    try:
+        return _FillOrder(payload)
+    except (ValueError, ArithmeticError):
+        return None
+
+
+async def _drain_orders(bus_port: BusOrderPort, bus: MessageBus) -> None:
+    """把待发指令发布到 trade.order（由 trade_gateway 执行）。"""
+    while True:
+        try:
+            for command in bus_port.drain():
+                await bus.publish_order_command(command_to_payload(command))
+                print(
+                    f"[strategy_core] 指令已发 {command.contract} "
+                    f"{command.direction} {command.offset} {command.quantity}",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001 - 发布失败不杀死主循环
+            print(f"[strategy_core] 指令发布失败: {exc}", flush=True)
+        await asyncio.sleep(0.1)
 
 
 def main() -> None:
