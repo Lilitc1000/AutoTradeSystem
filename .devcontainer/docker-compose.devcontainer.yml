@@ -10,7 +10,7 @@
 #   python3 scripts/ensure_env.py --env dev
 #   docker compose -f .devcontainer/docker-compose.devcontainer.yml up -d --build
 #
-# 端口：2223=SSH(ats.py)  8000=api_dashboard  5173=frontend(M3)  5432=PG  6379=Redis
+# 端口：2223=SSH(ats.py)  8000=api_dashboard  8673=frontend(M3)  5432=PG  6379=Redis
 # 注意：2223/5432/6379 与 doc_process_studio 的 devcontainer（2222）错开，可并行运行。
 
 services:
@@ -135,6 +135,8 @@ services:
     env_file: [.env]
     environment:
       - PYTHONPATH=src
+      # .env 无 DATABASE_URL（app 容器由 devcontainer 注入）——此处显式构造
+      - DATABASE_URL=postgresql+asyncpg://autotrade:${POSTGRES_PASSWORD}@db:5432/autotrade
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
     working_dir: /workspace/backend
     volumes:
@@ -156,14 +158,14 @@ services:
     volumes:
       - ..:/workspace:delegated
     ports:
-      - "5173:5173"
+      - "8673:8673"
     command:
       - "npx"
       - "vite"
       - "--host"
       - "0.0.0.0"
       - "--port"
-      - "5173"
+      - "8673"
 volumes:
   postgres_data:
   redis_data:

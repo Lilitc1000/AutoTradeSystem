@@ -5,8 +5,8 @@ export default defineConfig({
   plugins: [vue()],
   server: {
     host: "0.0.0.0",
-    port: 5173,
-    // /api → api_dashboard（compose service，容器内 8000）
+    port: 8673,
+    // 端口 8673：避开常用 5173（与其他项目前端防冲突）
     proxy: {
       "/api": {
         target: process.env.API_TARGET ?? "http://127.0.0.1:8000",

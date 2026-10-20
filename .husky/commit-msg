@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# commit-msg：Conventional Commits + scope 白名单校验（commitlint）
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+if [ -f node_modules/.bin/commitlint ]; then
+    node_modules/.bin/commitlint --edit "$1"
+else
+    echo "[gate][warn] commitlint 未安装，跳过提交信息校验"
+    exit 0
+fi

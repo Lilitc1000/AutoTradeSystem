@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# pre-commit：staged 文件门禁（容器优先，本机兜底，都没有则警告不阻塞）
+#
+# 设计原则：开发主环境是 devcontainer（ruff 在容器内），但提交也可能发生在
+# WSL 裸环境——门禁不能因环境差异卡死提交，只用可用资源做最大检查。
+
+set -u
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+CONTAINER="devcontainer-app-1"
+container_running() {
+    docker info >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"
+}
+
+backend_files=$(git diff --cached --name-only --diff-filter=ACM | grep '^backend/.*\.py$' || true)
+frontend_files=$(git diff --cached --name-only --diff-filter=ACM | grep '^frontend/src/.*\.\(ts\|vue\)$' || true)
+
+status=0
+
+if [ -n "$backend_files" ]; then
+    echo "[gate] ruff check（backend, $(echo "$backend_files" | wc -l) 个文件）"
+    if container_running; then
+        docker exec -w /workspace/backend "$CONTAINER" python3 -m ruff check src tests --no-cache || status=1
+    elif command -v ruff >/dev/null 2>&1; then
+        (cd backend && ruff check src tests --no-cache) || status=1
+    elif python3 -c 'import ruff' 2>/dev/null; then
+        (cd backend && python3 -m ruff check src tests --no-cache) || status=1
+    else
+        echo "[gate][warn] 无 ruff 环境（容器未运行/本机未装），跳过 ruff 检查——请自行确认"
+    fi
+fi
+
+if [ -n "$frontend_files" ]; then
+    echo "[gate] vue-tsc 类型检查（frontend, $(echo "$frontend_files" | wc -l) 个文件）"
+    if [ -f frontend/node_modules/.bin/vue-tsc ]; then
+        (cd frontend && node_modules/.bin/vue-tsc --noEmit) || status=1
+    else
+        echo "[gate][warn] frontend/node_modules 未安装，跳过 vue-tsc——请先 npm install"
+    fi
+fi
+
+if [ "$status" -ne 0 ]; then
+    echo "[gate] 门禁未通过，提交被阻止"
+fi
+exit "$status"

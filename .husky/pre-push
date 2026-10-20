@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# pre-push：推送前全量测试（保险闸——容器优先，本机兜底，都没有则警告不阻塞）
+#
+# 为什么放 pre-push 而不是 pre-commit：全量 pytest ~20s，放提交时会太吵；
+# 推送是代码离开本机的最后关口，值得跑一遍。
+
+set -u
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+CONTAINER="devcontainer-app-1"
+container_running() {
+    docker info >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"
+}
+
+if container_running; then
+    echo "[gate] 后端全量测试（容器内 pytest）..."
+    if ! docker exec -w /workspace/backend "$CONTAINER" bash -c 'PYTHONPATH=src python3 -m pytest tests -q'; then
+        echo "[gate] 测试未通过，推送被阻止"
+        exit 1
+    fi
+elif command -v pytest >/dev/null 2>&1 && python3 -c 'import futures_trading' 2>/dev/null; then
+    echo "[gate] 后端全量测试（本机 pytest）..."
+    if ! (cd backend && PYTHONPATH=src python3 -m pytest tests -q); then
+        echo "[gate] 测试未通过，推送被阻止"
+        exit 1
+    fi
+else
+    echo "[gate][warn] 无测试环境（容器未运行/本机无依赖），跳过全量测试——请自行确认"
+fi
+
+exit 0
