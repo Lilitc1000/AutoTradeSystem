@@ -8,6 +8,15 @@ set -u
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
+# Windows git 通道（UNC cwd）下容器门禁不可用——降级警告不阻塞。
+# 完整门禁在 WSL git（主开发环境）生效：ruff/vue-tsc/pytest。
+case "$PWD" in
+    //*|/mnt/*)
+        echo "[gate][warn] UNC/跨文件系统环境，容器门禁不可用——请用 WSL git 提交以启用完整门禁"
+        exit 0
+        ;;
+esac
+
 CONTAINER="devcontainer-app-1"
 container_running() {
     docker info >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"
@@ -21,6 +30,8 @@ status=0
 if [ -n "$backend_files" ]; then
     echo "[gate] ruff check（backend, $(echo "$backend_files" | wc -l) 个文件）"
     if container_running; then
+        # docker.exe 不支持 UNC 工作目录（Windows git 通道实踩）——先切本地盘
+        case "$PWD" in //*) cd /tmp 2>/dev/null || cd / ;; esac
         docker exec -w /workspace/backend "$CONTAINER" python3 -m ruff check src tests --no-cache || status=1
     elif command -v ruff >/dev/null 2>&1; then
         (cd backend && ruff check src tests --no-cache) || status=1

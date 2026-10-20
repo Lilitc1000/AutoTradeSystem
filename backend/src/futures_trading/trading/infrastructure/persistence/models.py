@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -320,4 +321,37 @@ __all__ = [
     "BacktestRun",
     "BacktestTrade",
     "AuditLog",
+    "TradeAccount",
 ]
+
+
+# ---------------------------------------------------------------- 交易账号（M3-e）
+class TradeAccount(Base):
+    """CTP/SimNow 交易账号（凭证加密存储，Fernet——见 common/crypto）。
+
+    多账号 + 单激活：trade_gateway/strategy_core 用激活账号连接；
+    手动与自动下单共用（单一交易出口，M3-e2）。
+    """
+
+    __tablename__ = "trade_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    broker_id: Mapped[str] = mapped_column(String(16), nullable=False, default="9999")
+    user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    encrypted_password: Mapped[str] = mapped_column(Text, nullable=False)
+    app_id: Mapped[str] = mapped_column(String(32), nullable=False, default="simnow_client_test")
+    encrypted_auth_code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    md_front: Mapped[str] = mapped_column(String(128), nullable=False)
+    trade_front: Mapped[str] = mapped_column(String(128), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_test_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)  # 连接测试结果
+    last_test_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_test_msg: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("broker_id", "user_id", name="uq_trade_accounts_broker_user"),
+        Index("ix_trade_accounts_active", "is_active"),
+    )

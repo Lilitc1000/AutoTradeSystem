@@ -16,6 +16,7 @@ from sqlalchemy import text
 
 from ..common.settings import settings
 from ..trading.infrastructure.persistence.database import database
+from ..trading.router.accounts import router as accounts_router
 from ..trading.router.backtest import router as backtest_router
 from ..trading.router.stream import router as stream_router
 from ..trading.router.trading import router as trading_router
@@ -33,6 +34,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="AutoTradeSystem Dashboard API", version="0.1.0", lifespan=lifespan)
 app.include_router(backtest_router)
+app.include_router(accounts_router)
 app.include_router(trading_router)
 app.include_router(stream_router)
 

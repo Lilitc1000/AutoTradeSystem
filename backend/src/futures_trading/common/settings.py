@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     ctp_broker_id: str = "9999"
     ctp_md_front: str = "tcp://182.254.243.31:30011"
     ctp_trade_front: str = "tcp://182.254.243.31:30001"
+    # 凭证加密密钥（Fernet，M3-e 账号体系）——空则账号保存被拒（回落 .env）
+    settings_encryption_key: str = ""
 
 
 settings = Settings()

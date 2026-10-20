@@ -105,6 +105,20 @@ class CtpConfig:
             trade_front=settings.ctp_trade_front,
         )
 
+    @classmethod
+    async def from_active_account(cls) -> CtpConfig:
+        """激活账号（DB，M3-e）优先；无激活账号回落 .env（迁移期兼容）。
+
+        凭证在库里加密——解密只在构造 CtpConfig 时发生，不落日志。
+        """
+        from ...application.account_service import AccountService  # noqa: PLC0415 - 防循环导入
+
+        values = await AccountService().active_config_dict()
+        if values is None:
+            logger.info("无激活交易账号，回落 .env 配置")
+            return cls.from_settings()
+        return cls(**values)
+
 
 class CtpMarketData(MarketDataPort):
     """CTP 行情适配器：spi 回调 → BarAggregator → MessageBus.publish_bar。

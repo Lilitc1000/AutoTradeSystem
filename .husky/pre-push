@@ -14,6 +14,8 @@ container_running() {
 }
 
 if container_running; then
+    # docker.exe 不支持 UNC 工作目录——先切本地盘
+    case "$PWD" in //*) cd /tmp 2>/dev/null || cd / ;; esac
     echo "[gate] 后端全量测试（容器内 pytest）..."
     if ! docker exec "" bash -c 'cd /workspace/backend && PYTHONPATH=src python3 -m pytest tests -q'; then
         echo "[gate] 测试未通过，推送被阻止"
