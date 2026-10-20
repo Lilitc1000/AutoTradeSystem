@@ -91,3 +91,6 @@ RUN bash /tmp/fetch_ctp_headers.sh \
     && rm /tmp/fetch_ctp_headers.sh
 
 EXPOSE 22
+
+# Node.js（M3 前端：vite / vitest / vue-tsc）
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm     && rm -rf /var/lib/apt/lists/*

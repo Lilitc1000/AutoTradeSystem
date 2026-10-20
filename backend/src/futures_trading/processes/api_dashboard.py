@@ -17,6 +17,8 @@ from sqlalchemy import text
 from ..common.settings import settings
 from ..trading.infrastructure.persistence.database import database
 from ..trading.router.backtest import router as backtest_router
+from ..trading.router.stream import router as stream_router
+from ..trading.router.trading import router as trading_router
 
 # 被监控的 worker 进程（写 Redis 心跳）。api_dashboard 自身不在列——
 # 能访问到 healthz 即证明它活着。
@@ -31,6 +33,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="AutoTradeSystem Dashboard API", version="0.1.0", lifespan=lifespan)
 app.include_router(backtest_router)
+app.include_router(trading_router)
+app.include_router(stream_router)
 
 
 @app.get("/healthz")

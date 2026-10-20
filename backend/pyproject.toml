@@ -61,6 +61,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "ARG"]
 "src/futures_trading/trading/infrastructure/ctp/adapters.py" = ["ARG002"]
 "src/futures_trading/trading/infrastructure/ctp/worker.py" = ["ARG002"]
 "tests/infrastructure/test_ctp_adapters.py" = ["ARG001", "ARG002", "SLF001"]
+"tests/processes/test_trading_router.py" = ["ARG002"]  # Fake pubsub 对齐真 redis 签名
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

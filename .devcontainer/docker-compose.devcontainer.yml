@@ -10,7 +10,7 @@
 #   python3 scripts/ensure_env.py --env dev
 #   docker compose -f .devcontainer/docker-compose.devcontainer.yml up -d --build
 #
-# 端口：2223=SSH(ats.py)  8000=api_dashboard(M2+)  5432=PG  6379=Redis
+# 端口：2223=SSH(ats.py)  8000=api_dashboard  5173=frontend(M3)  5432=PG  6379=Redis
 # 注意：2223/5432/6379 与 doc_process_studio 的 devcontainer（2222）错开，可并行运行。
 
 services:
@@ -123,6 +123,48 @@ services:
       timeout: 5s
       retries: 5
 
+
+  api_dashboard:
+    image: devcontainer-app:latest
+    depends_on:
+      app:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      - PYTHONPATH=src
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+    working_dir: /workspace/backend
+    volumes:
+      - ..:/workspace:delegated
+    command:
+      - "python3"
+      - "-m"
+      - "futures_trading.processes.api_dashboard"
+
+  frontend:
+    image: devcontainer-app:latest
+    depends_on:
+      api_dashboard:
+        condition: service_started
+    restart: unless-stopped
+    environment:
+      - API_TARGET=http://api_dashboard:8000
+    working_dir: /workspace/frontend
+    volumes:
+      - ..:/workspace:delegated
+    ports:
+      - "5173:5173"
+    command:
+      - "npx"
+      - "vite"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "5173"
 volumes:
   postgres_data:
   redis_data:
+
