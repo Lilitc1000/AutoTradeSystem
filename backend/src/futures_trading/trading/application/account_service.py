@@ -184,12 +184,17 @@ class AccountService:
         ok = False
         msg = ""
         runner = self._worker_runner or _default_runner
+        # 用真 CtpConfig——自造 duck-typed 配置与 worker 期望字段不一致
+        # 会让 worker 卡住（表现为 25s 超时），不复用生产路径就是埋雷
+        from ..infrastructure.ctp.adapters import CtpConfig  # noqa: PLC0415
+
+        ctp_config = CtpConfig(**config)
         ctx = multiprocessing.get_context("spawn")
         q: Any = ctx.Queue()
         cmd_q: Any = ctx.Queue()
         worker = ctx.Process(
             target=runner,
-            args=(q, cmd_q, _SimpleConfig(config), [], _TEST_LIFETIME, "td"),
+            args=(q, cmd_q, ctp_config, [], _TEST_LIFETIME, "td"),
             name="ctp-account-probe",
             daemon=True,
         )
@@ -222,23 +227,6 @@ class AccountService:
                 row.last_test_msg = msg
                 await session.commit()
         return {"ok": ok, "msg": msg}
-
-
-class _SimpleConfig:
-    """duck-typed CtpConfig（worker 只用属性，不 import 适配器——避免循环）。"""
-
-    def __init__(self, values: dict[str, Any]) -> None:
-        self._values = values
-        for key, value in values.items():
-            setattr(self, key, value)
-        self.flow_dir = "/tmp/futures_ctp"
-
-    def flow_path(self, name: str) -> str:
-        import os
-
-        path = os.path.join(self.flow_dir, name)
-        os.makedirs(path, exist_ok=True)
-        return path
 
 
 def _default_runner(*args: Any, **kwargs: Any) -> None:

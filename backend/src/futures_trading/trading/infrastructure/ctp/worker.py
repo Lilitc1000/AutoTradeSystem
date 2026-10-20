@@ -293,16 +293,21 @@ def run_ctp_worker(
     q：子→父队列；cmd_q：父→子指令队列（td 模式用）
     mode："md"=行情，"td"=交易（认证链 + 指令循环）
     """
-    import gc
-
-    gc.disable()  # 约束 1
-
     # 子进程入口：配置日志（spawn 子进程不继承父进程的 logging 配置）
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s %(message)s")
+    # 注意：**不要**在这里 logging.basicConfig——实测会让 CTP 初始化
+    # 阶段 SIGSEGV（exitcode=-11，无任何日志）。worker 状态靠队列回报，
+    # 日志配置由父进程（spawn import 主模块时）继承。
 
     if mode == "td":
+        # 约束 1 的 gc.disable() **不能用于 td**：实测会让子进程在 CTP
+        # 初始化前 SIGSEGV（exitcode=-11，无任何日志）——该约束是当初为
+        # md worker 的 SWIG 析构崩溃加的，只对 md 生效。
         _run_td(q, cmd_q, config, lifetime)
         return
+
+    import gc
+
+    gc.disable()  # 约束 1（md 专用：SWIG 对象析构竞态）
     _run_md(q, config, contracts, lifetime)
 
 
