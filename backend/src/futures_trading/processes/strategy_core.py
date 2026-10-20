@@ -21,7 +21,8 @@ import redis.asyncio as redis
 from ..common.instrument_registry import get_instrument
 from ..common.settings import settings
 from ..common.types import Price, Quantity
-from ..trading.application.dtos import Bar
+from ..trading.application.dtos import Bar, Tick
+from ..trading.application.ports import OrderPort
 from ..trading.application.shadow import ShadowConfig, ShadowEngine
 from ..trading.infrastructure.messaging.bus import MessageBus
 from .base import ProcessBase
@@ -77,6 +78,7 @@ async def run_shadow(symbols: list[str], config: ShadowConfig, mode: str = "shad
     instruments = {s: get_instrument(s) for s in symbols}
     gateway = None
     account = None
+    latest_bars: dict[str, Bar] = {}  # 执行器定价基准（最新 bar 收盘价）
     if mode == "sim":
         from ..trading.infrastructure.ctp.adapters import (  # noqa: PLC0415 - 懒加载（Linux C++ 扩展）
             CtpAccount,
@@ -87,8 +89,25 @@ async def run_shadow(symbols: list[str], config: ShadowConfig, mode: str = "shad
         gateway = CtpTradeGateway(CtpConfig.from_settings(), MessageBus(), instruments)
         await gateway.start()
         account = CtpAccount(gateway)
+        # 执行器接线：策略层的 MARKET/LIMIT 语义由 ExecutionService 翻译为
+        # "对手价±N tick 限价 + 未成交撤单重发"（SHFE 无市价单——错误码 79）。
+        # 鸭子类型实现 OrderPort，ShadowEngine/pipeline 零改动。
+        from ..trading.application.execution import ExecutionService  # noqa: PLC0415
 
-    engine = ShadowEngine(config, instruments, order_port=gateway, external_fills=(mode == "sim"))
+        def _tick_provider(contract: str) -> Tick | None:
+            bar = latest_bars.get(contract)
+            if bar is None:
+                symbol = "".join(ch for ch in contract if ch.isalpha())
+                bar = latest_bars.get(symbol)
+            if bar is None:
+                return None
+            return Tick(symbol=contract, ts=bar.ts, last_price=bar.close)
+
+        executor: OrderPort | None = ExecutionService(gateway, _tick_provider, instruments)
+    else:
+        executor = None
+
+    engine = ShadowEngine(config, instruments, order_port=executor, external_fills=(mode == "sim"))
     bus = MessageBus()
     print(f"[strategy_core] {mode} 实例 {config.instance_id} 就绪，订阅 {len(symbols)} 个品种", flush=True)
     bar_count = 0
@@ -98,6 +117,7 @@ async def run_shadow(symbols: list[str], config: ShadowConfig, mode: str = "shad
     try:
         async for _channel, payload in bus.subscribe(*[f"md.bar.{s}" for s in symbols]):
             bar = _payload_to_bar(payload)
+            latest_bars[bar.symbol] = bar
             results = engine.on_bar(bar)
             bar_count += 1
             for outcome in results:

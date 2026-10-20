@@ -549,7 +549,12 @@ class CtpTradeGateway(OrderPort):
                 return
 
     async def _supervise(self) -> None:
-        """worker 崩溃/退出 → 重启。"""
+        """worker 崩溃/退出 → 重启 → 重启后对账。
+
+        7×24 无人值守：不只是重启进程——重启后必须 sync_state 对齐
+        柜台订单状态（崩溃期间的成交/拒单本地不知道），否则仓位/资金
+        状态会漂移。
+        """
         while True:
             await asyncio.sleep(2)
             if self._stopping or self._worker is None:
@@ -561,6 +566,21 @@ class CtpTradeGateway(OrderPort):
                 )
                 self._ready.clear()
                 self._start_worker()
+                asyncio.create_task(self._reconcile_after_restart())
+
+    async def _reconcile_after_restart(self) -> None:
+        """等新 worker 就绪后自动对账（失败只告警，不阻断监督循环）。"""
+        for _ in range(120):
+            await asyncio.sleep(1)
+            if self._stopping:
+                return
+            if self._ready.is_set():
+                break
+        try:
+            await self.sync_state()
+            logger.info("worker 重启后对账已触发（ReqQryOrder）")
+        except RuntimeError as exc:
+            logger.warning("重启后对账跳过: %s", exc)
 
     async def stop(self) -> None:
         self._stopping = True
@@ -631,16 +651,18 @@ class CtpTradeGateway(OrderPort):
         return self._request_id
 
     async def sync_state(self) -> None:
-        """重启对账：查询柜台订单，重建本地订单状态（M1 设计原则）。"""
-        if self._api is None or not self._ready.is_set():
+        """重启对账：经 worker 查询柜台订单，回报走域状态机重建本地状态。
+
+        7×24 无人值守的关键一环：worker 崩溃重启后，本地订单状态可能与
+        柜台不一致（重启期间成交/拒单未知）——ReqQryOrder 回报以
+        OrderRef 匹配本地订单并迁移状态（M1 设计原则：柜台为准）。
+        """
+        if self._worker is None or not self._ready.is_set():
             raise RuntimeError("交易会话未就绪")
-        _md, trade = _load_ctp()
-        values = {
-            "BrokerID": self.config.broker_id,
-            "InvestorID": self.config.user_id,
-        }
-        self._request_id += 1
-        self._api.ReqQryOrder(_to_field(values, trade.CThostFtdcQryOrderField), self._request_id)
+        self._send_cmd(
+            "query_order",
+            {"BrokerID": self.config.broker_id, "InvestorID": self.config.user_id},
+        )
 
     # ---- 内部 ----
 

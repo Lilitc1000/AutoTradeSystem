@@ -17,6 +17,7 @@ OrderPort 接口不变，执行器是它的上层使用者。
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -114,7 +115,107 @@ class ExecutionService:
         diff = price - reference if direction is Direction.LONG else reference - price
         return diff > limit
 
-    # ---- 执行主循环 ----
+    # ---- OrderPort 协议（鸭子类型：策略层/ShadowEngine 零改动）----
+
+    def submit(self, command: OrderCommand) -> Order:
+        """OrderPort 入口：同步追单执行（pipeline 无感，拿到的就是执行器）。
+
+        SHFE 无市价单（错误码 79）——策略层的 MARKET 语义由这里翻译为
+        "对手价 ± N tick 限价 + 未成交撤单重发"；LIMIT 则直接以该限价
+        起步追单。
+        """
+        order, _result = self._execute_sync(command)
+        return order
+
+    def cancel(self, order_id: str) -> Order:
+        return self.orders.cancel(order_id)
+
+    def query(self, order_id: str) -> Order | None:
+        return self.orders.query(order_id)
+
+    # ---- 同步执行（策略管线是同步的）----
+
+    def execute_sync(self, command: OrderCommand) -> ExecutionResult:
+        """同步版追单执行（与 execute 等价，供同步调用方用）。"""
+        _order, result = self._execute_sync(command)
+        return result
+
+    def _execute_sync(self, command: OrderCommand) -> tuple[Order, ExecutionResult]:
+        tick = self.ticks(command.contract)
+        reference = self._reference_price(command.direction, tick)
+        if reference is None:
+            order = self._submit_once_sync(command)
+            result = ExecutionResult(
+                requested=command.quantity,
+                filled=Quantity(Decimal(order.filled_quantity)),
+                remaining=Quantity(max(Decimal(command.quantity) - Decimal(order.filled_quantity), ZERO)),
+                attempts=1,
+                avg_price=Price(Decimal(order.avg_fill_price)) if order.avg_fill_price else None,
+                completed=order.is_final,
+            )
+            return order, result
+
+        requested = Decimal(command.quantity)
+        remaining = requested
+        filled_total = Decimal("0")
+        notional = Decimal("0")
+        attempts = 0
+        last_order: Order | None = None
+
+        for attempt in range(1, self.config.max_attempts + 1):
+            if remaining <= ZERO:
+                break
+            price = self._chase_price(command.direction, reference, attempt, command.symbol)
+            if self._slippage_exceeded(command.direction, reference, price, command.symbol):
+                break  # 滑点保护：宁可少开不多亏
+            attempts = attempt
+            round_command = replace(
+                command,
+                quantity=Quantity(remaining),
+                limit_price=Price(price),
+            )
+            last_order = self.orders.submit(round_command)
+            filled = self._wait_fill_sync(last_order, self.config.timeout_seconds)
+            filled_total += filled
+            remaining -= filled
+            if filled > ZERO and last_order.avg_fill_price is not None:
+                notional += filled * Decimal(last_order.avg_fill_price)
+            if remaining > ZERO:
+                self.orders.cancel(last_order.order_id)
+
+        avg = notional / filled_total if filled_total > ZERO else None
+        result = ExecutionResult(
+            requested=Quantity(requested),
+            filled=Quantity(filled_total),
+            remaining=Quantity(max(remaining, ZERO)),
+            attempts=attempts,
+            avg_price=Price(avg) if avg is not None else None,
+            completed=remaining <= ZERO,
+        )
+        assert last_order is not None
+        return last_order, result
+
+    def _submit_once_sync(self, command: OrderCommand) -> Order:
+        """无行情回落：原样提交一次并等待成交。"""
+        order = self.orders.submit(command)
+        self._wait_fill_sync(order, self.config.timeout_seconds)
+        return order
+
+    def _wait_fill_sync(self, order: Order, timeout: float) -> Decimal:
+        """轮询订单成交数量（OrderPort.query），直到全部成交/终态/超时。"""
+        deadline = time.monotonic() + timeout
+        last = Decimal(order.filled_quantity)
+        while True:
+            current = self.orders.query(order.order_id)
+            if current is not None:
+                last = Decimal(current.filled_quantity)
+                if current.is_final:
+                    return last
+            if time.monotonic() >= deadline:
+                return last
+            time.sleep(self.config.poll_interval)
+
+    # ---- 异步执行主循环（原有入口，回测/异步调用方用）----
 
     async def execute(self, command: OrderCommand, tick: Tick | None = None) -> ExecutionResult:
         """执行指令，返回成交结果（尽量把 requested 全部成交）。"""

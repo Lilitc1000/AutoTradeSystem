@@ -107,7 +107,13 @@ def _assign(field: Any, values: dict[str, Any]) -> None:
 
 
 def _handle_cmd(
-    api: Any, cmd: dict[str, Any], order_field: Any, action_field: Any, acct_field: Any, pos_field: Any
+    api: Any,
+    cmd: dict[str, Any],
+    order_field: Any,
+    action_field: Any,
+    acct_field: Any,
+    pos_field: Any,
+    qry_order_field: Any,
 ) -> None:
     """执行父进程下发的指令（submit/cancel/query_account）。"""
     state = _CMD_STATE
@@ -125,6 +131,8 @@ def _handle_cmd(
         api.ReqQryTradingAccount(acct_field, state["req_id"])
     elif action == "query_position":
         api.ReqQryInvestorPosition(pos_field, state["req_id"])
+    elif action == "query_order":
+        api.ReqQryOrder(qry_order_field, state["req_id"])
 
 
 _CMD_STATE: dict[str, int] = {"req_id": 0}
@@ -148,6 +156,7 @@ def _run_td(q: Any, cmd_q: Any, config: Any, lifetime: float | None) -> None:
         CThostFtdcInputOrderActionField,
         CThostFtdcInputOrderField,
         CThostFtdcQryInvestorPositionField,
+        CThostFtdcQryOrderField,
         CThostFtdcQryTradingAccountField,
         CThostFtdcReqAuthenticateField,
         CThostFtdcReqUserLoginField,
@@ -177,6 +186,9 @@ def _run_td(q: Any, cmd_q: Any, config: Any, lifetime: float | None) -> None:
     pos_field = CThostFtdcQryInvestorPositionField()
     pos_field.BrokerID = config.broker_id
     pos_field.InvestorID = config.user_id
+    qry_order_field = CThostFtdcQryOrderField()
+    qry_order_field.BrokerID = config.broker_id
+    qry_order_field.InvestorID = config.user_id
 
     api: Any = None
 
@@ -224,6 +236,11 @@ def _run_td(q: Any, cmd_q: Any, config: Any, lifetime: float | None) -> None:
             if pAccount is not None:
                 q.put({"type": ACCOUNT, "data": _snapshot(pAccount, _ACCOUNT_FIELDS)})
 
+        def OnRspQryOrder(self, pOrder: Any, pRspInfo: Any, nRequestID: int, bIsLast: bool) -> None:
+            """对账回报：经队列回传父进程，走域订单状态机重建本地状态。"""
+            if pOrder is not None:
+                q.put({"type": ORDER, "data": _snapshot(pOrder, _ORDER_FIELDS)})
+
         def OnRspQryInvestorPosition(self, pPosition: Any, pRspInfo: Any, nRequestID: int, bIsLast: bool) -> None:
             if pPosition is not None:
                 q.put({"type": POSITION, "data": _snapshot(pPosition, _POSITION_FIELDS)})
@@ -242,8 +259,13 @@ def _run_td(q: Any, cmd_q: Any, config: Any, lifetime: float | None) -> None:
     logger.info("[ctp-worker-td] 已启动")
 
     deadline = time.time() + lifetime if lifetime else None
+    stop = threading.Event()
+    _install_signal_handlers(stop)
     try:
         while True:
+            if stop.is_set():
+                logger.info("[ctp-worker-td] 收到停止信号，优雅退出")
+                break
             if deadline is not None and time.time() >= deadline:
                 logger.info("[ctp-worker-td] 存活期到，主动退出")
                 break
@@ -252,7 +274,7 @@ def _run_td(q: Any, cmd_q: Any, config: Any, lifetime: float | None) -> None:
             except Empty:
                 time.sleep(0.05)
                 continue
-            _handle_cmd(api, cmd, order_field, action_field, acct_field, pos_field)
+            _handle_cmd(api, cmd, order_field, action_field, acct_field, pos_field, qry_order_field)
     finally:
         api.Release()
         logger.info("[ctp-worker-td] 已退出")
@@ -282,6 +304,23 @@ def run_ctp_worker(
         _run_td(q, cmd_q, config, lifetime)
         return
     _run_md(q, config, contracts, lifetime)
+
+
+def _install_signal_handlers(stop: Any) -> None:
+    """SIGTERM/SIGINT 优雅停机：置停止标志让主循环走 finally Release()。
+
+    没有这个，compose stop/父进程 terminate 时 daemon 立即死，CTP so
+    来不及析构——segfault + 柜台侧连接非优雅关闭（保留 1-2 分钟，
+    阻塞下次登录）。7×24 无人值守的基本要求。
+    """
+    import signal
+
+    def _handler(signum: int, _frame: Any) -> None:
+        logger.info("收到信号 %s，优雅停机中", signum)
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
 
 
 def _run_md(q: Any, config: Any, contracts: list[str], lifetime: float | None) -> None:
@@ -340,8 +379,13 @@ def _run_md(q: Any, config: Any, contracts: list[str], lifetime: float | None) -
     logger.info("[ctp-worker] 已启动（pid 独立进程）contracts=%s", contracts)
 
     deadline = time.time() + lifetime if lifetime else None
+    stop = threading.Event()
+    _install_signal_handlers(stop)
     try:
         while True:
+            if stop.is_set():
+                logger.info("[ctp-worker] 收到停止信号，优雅退出")
+                break
             if deadline is not None and time.time() >= deadline:
                 logger.info("[ctp-worker] 存活期到，主动退出（内存重置）")
                 break

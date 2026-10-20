@@ -206,3 +206,26 @@ class TestConfig:
             ExecutionConfig(max_attempts=0)
         with pytest.raises(ValueError, match="tick 偏移"):
             ExecutionConfig(tick_offset=-1)
+
+
+class TestSyncSubmitAsOrderPort:
+    """同步入口（OrderPort 鸭子类型）：策略管线无感接入（日盘 10-20 补）。"""
+
+    def test_submit_chases_and_returns_order(self) -> None:
+        port = FakeOrderPort(fill_plan=["2", "8"])
+        service = ExecutionService(port, lambda _c: _tick(), {"rb": _instrument()})
+        order = service.submit(_command("10"))
+        # 追单是多笔订单：submit 返回最后一轮（OrderPort 语义），
+        # 总成交 = 各轮累计（2 + 8）
+        assert order.is_final
+        total = sum((Decimal(o.filled_quantity) for o in port.orders.values()), Decimal("0"))
+        assert total == Decimal("10")
+        assert len(port.cancelled) == 1  # 第一轮部分成交后撤单
+
+    def test_submit_delegates_cancel_and_query(self) -> None:
+        port = FakeOrderPort(fill_plan=["2"])  # 只成 2 手，非终态
+        service = ExecutionService(port, lambda _c: _tick(), {"rb": _instrument()})
+        order = service.submit(_command("5"))
+        assert service.query(order.order_id) is order
+        service.cancel(order.order_id)  # 委托给内部 port
+        assert port.cancelled
