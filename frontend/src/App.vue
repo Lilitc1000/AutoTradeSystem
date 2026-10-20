@@ -13,6 +13,7 @@ import { NConfigProvider, NMessageProvider } from "naive-ui";
             <router-link to="/dashboard">总览</router-link>
             <router-link to="/trading">交易监控</router-link>
             <router-link to="/accounts">交易账号</router-link>
+            <router-link to="/manual">手动下单</router-link>
           </nav>
         </header>
         <main class="content">

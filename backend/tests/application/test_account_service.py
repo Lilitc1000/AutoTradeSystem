@@ -109,12 +109,13 @@ def _payload(**overrides: Any) -> dict[str, Any]:
 
 class TestAccountCrud:
     async def test_create_list_never_leaks_secrets(self, service: AccountService) -> None:
+        """脱敏断言不依赖空库——联调库里已有账号时也应成立。"""
         view = await service.create_account(_payload())
         assert view["name"] == "SimNow 主账号"
-        assert view["is_active"] is True  # 首个账号自动激活
         listed = await service.list_accounts()
-        assert len(listed) == 1
-        blob = repr(listed[0])
+        mine = [row for row in listed if row["id"] == view["id"]]
+        assert len(mine) == 1, "新建账号应出现在列表里"
+        blob = repr(listed)  # 全表都不该出现明文/密文
         assert "s3cr3t" not in blob
         assert "encrypted" not in blob  # 无密文字段
 
