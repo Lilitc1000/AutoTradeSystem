@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -22,6 +23,7 @@ from ..infrastructure.persistence.models import TradeAccount
 # 连接测试等待上限（秒）——与 CtpTradeGateway._drain_until_ready 一致
 _TEST_TIMEOUT = 25
 _TEST_LIFETIME = 40  # worker 存活上限（兜底自杀）
+_RETRY_DELAY = 8  # SIGSEGV 后等会话释放再重试（秒）
 
 
 @asynccontextmanager
@@ -162,7 +164,27 @@ class AccountService:
 
         与生产同代码路径（run_ctp_worker mode="td"）——测试通过的账号
         就是能交易的账号。结果落库（last_test_ok/at/msg）。
+
+        偶发 SIGSEGV(-11)：上一个 CTP 会话未完全释放就起新 worker 会撞
+        （密集重试必然遇到）——等一会儿重试一次再下结论，避免把时序问题
+        误报成"凭证错误"。
         """
+        ok, msg, worker = await self._probe_once(account_id)
+        if not ok and getattr(worker, "exitcode", None) == -11:
+            await asyncio.sleep(_RETRY_DELAY)
+            ok, msg, worker = await self._probe_once(account_id)
+
+        async with _session() as session:
+            row = await session.get(TradeAccount, account_id)
+            if row is not None:
+                row.last_test_ok = ok
+                row.last_test_at = datetime.now(UTC)
+                row.last_test_msg = msg
+                await session.commit()
+        return {"ok": ok, "msg": msg}
+
+    async def _probe_once(self, account_id: int) -> tuple[bool, str, Any]:
+        """单次探测：起 worker → 等 READY → 收尾。返回 (ok, msg, worker)。"""
         import multiprocessing
         import queue as _queue
         import time
@@ -184,8 +206,7 @@ class AccountService:
         ok = False
         msg = ""
         runner = self._worker_runner or _default_runner
-        # 用真 CtpConfig——自造 duck-typed 配置与 worker 期望字段不一致
-        # 会让 worker 卡住（表现为 25s 超时），不复用生产路径就是埋雷
+        # 用真 CtpConfig——与生产同构（自造 duck-typed config 曾导致卡死）
         from ..infrastructure.ctp.adapters import CtpConfig  # noqa: PLC0415
 
         ctp_config = CtpConfig(**config)
@@ -211,25 +232,20 @@ class AccountService:
                     msg = "认证/登录/结算单确认全部通过"
                     break
             if not ok and not worker.is_alive():
-                msg = f"worker 提前退出（exitcode={worker.exitcode}）——凭证或网络问题"
+                msg = f"worker 提前退出（exitcode={worker.exitcode}）——凭证或会话未释放"
             elif not ok:
                 msg = f"超时（{_TEST_TIMEOUT}s 未就绪）——柜台无响应或凭证错误"
         finally:
             if worker.is_alive():
                 worker.terminate()
                 worker.join(timeout=5)
-
-        async with _session() as session:
-            row = await session.get(TradeAccount, account_id)
-            if row is not None:
-                row.last_test_ok = ok
-                row.last_test_at = datetime.now(UTC)
-                row.last_test_msg = msg
-                await session.commit()
-        return {"ok": ok, "msg": msg}
+            else:
+                worker.join(timeout=1)  # 回收僵尸，确保会话释放
+        return ok, msg, worker
 
 
 def _default_runner(*args: Any, **kwargs: Any) -> None:
+    """默认 worker 入口（延迟 import 防循环）。"""
     from ..infrastructure.ctp.worker import run_ctp_worker
 
     run_ctp_worker(*args, **kwargs)
