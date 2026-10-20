@@ -15,13 +15,13 @@ container_running() {
 
 if container_running; then
     echo "[gate] 后端全量测试（容器内 pytest）..."
-    if ! docker exec -w /workspace/backend "$CONTAINER" bash -c 'PYTHONPATH=src python3 -m pytest tests -q'; then
+    if ! docker exec -w /workspace/backend "$CONTAINER" bash -c 'PYTHONPATH=src python3 -m pytest tests -q"'; then
         echo "[gate] 测试未通过，推送被阻止"
         exit 1
     fi
 elif command -v pytest >/dev/null 2>&1 && python3 -c 'import futures_trading' 2>/dev/null; then
     echo "[gate] 后端全量测试（本机 pytest）..."
-    if ! (cd backend && PYTHONPATH=src python3 -m pytest tests -q); then
+    if ! (cd backend && PYTHONPATH=src python3 -m pytest tests -q"); then
         echo "[gate] 测试未通过，推送被阻止"
         exit 1
     fi

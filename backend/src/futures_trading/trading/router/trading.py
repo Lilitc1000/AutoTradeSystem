@@ -118,18 +118,30 @@ async def account_summary() -> dict[str, object]:
 
 @router.get("/heartbeat")
 async def worker_heartbeat() -> dict[str, object]:
-    """三 worker 心跳快照（Redis hash，api_dashboard 自身不在列）。"""
+    """三 worker 心跳快照。
+
+    key 与 ProcessBase/strategy_core 写入侧一致：
+    `{prefix}:proc:{name}:hb`（时间戳，TTL 15s）+ `:mem`（RSS KB）。
+    此前误用 `heartbeat:{name}` 导致前端全显离线（实修）。
+    """
     import redis.asyncio as redis
 
     from ...common.settings import settings
 
+    prefix = settings.redis_key_prefix
     client = redis.from_url(settings.redis_url, decode_responses=True)
     try:
-        names = ("md_gateway", "strategy_core", "trade_gateway")
+        # trade_gateway 不设独立进程（交易在 strategy_core SIM 模式内），
+        # 列它会永远显示离线——误导
+        names = ("md_gateway", "strategy_core")
         beats: dict[str, object] = {}
         for name in names:
-            raw = await client.hgetall(f"heartbeat:{name}")
-            beats[name] = raw or None
+            ts = await client.get(f"{prefix}:proc:{name}:hb")
+            mem = await client.get(f"{prefix}:proc:{name}:mem")
+            if ts:
+                beats[name] = {"ts": ts, "mem_kb": int(mem) if mem else None}
+            else:
+                beats[name] = None
     finally:
         await client.close()
     return {"heartbeats": beats}

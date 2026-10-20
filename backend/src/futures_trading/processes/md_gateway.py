@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from datetime import UTC, datetime
 
 from ..common.instrument_registry import get_instrument
 from ..trading.infrastructure.ctp.adapters import CtpConfig, CtpMarketData
@@ -42,12 +43,31 @@ def _symbol_of(contract: str) -> str:
     return "".join(ch for ch in contract if not ch.isdigit())
 
 
+async def _heartbeat() -> None:
+    """CTP 源心跳（CTP 模式不走 ProcessBase，补写同款 key——否则 healthz
+    永远显示 md_gateway 离线，前端监控失效）。"""
+    import redis.asyncio as redis
+
+    from ..common.settings import settings
+
+    key = f"{settings.redis_key_prefix}:proc:md_gateway:hb"
+    client = redis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        while True:
+            await client.set(key, datetime.now(UTC).isoformat(), ex=15)
+            await asyncio.sleep(5)
+    finally:
+        await client.close()
+
+
 async def _run_ctp(md: CtpMarketData, max_runtime_minutes: int = 0) -> None:
     """asyncio 部分：运行已创建好的 CtpMarketData（create() 须在主帧先调用）。"""
     logger.info("CtpMarketData 运行中（max_runtime=%d 分钟，0=不限）", max_runtime_minutes)
+    heartbeat_task = asyncio.create_task(_heartbeat())
     try:
         await md.run(max_runtime_seconds=max_runtime_minutes * 60)
     finally:
+        heartbeat_task.cancel()
         logger.info("CTP 源退出，stop() ...")
         await md.stop()
         await md.bus.close()
