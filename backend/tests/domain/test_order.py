@@ -65,10 +65,14 @@ class TestStateMachine:
         order.partial_fill(Quantity(Decimal("1")), Price(Decimal("3501")))
         assert order.status is OrderStatus.FILLED
 
-    def test_pending_cannot_skip_to_filled(self) -> None:
+    def test_pending_fill_auto_submits_first(self) -> None:
+        """成交回报先于委托确认到达（CTP 回报乱序）时，partial_fill 自动补
+        SUBMITTED 迁移再进 FILLED——领域不变式：成交前必先提交。"""
         order = make_order()
-        with pytest.raises(InvalidOrderTransitionError, match="非法订单状态迁移"):
-            order.partial_fill(Quantity(Decimal("2")), Price(Decimal("3500")))
+        order.partial_fill(Quantity(Decimal("2")), Price(Decimal("3500")))
+        assert order.status is OrderStatus.FILLED
+        assert order.filled_quantity == Quantity(Decimal("2"))
+        assert order.avg_fill_price == Price(Decimal("3500"))
 
     def test_final_state_is_terminal(self) -> None:
         order = make_order()

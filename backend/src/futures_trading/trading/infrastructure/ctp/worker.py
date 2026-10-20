@@ -130,6 +130,18 @@ def _handle_cmd(
 _CMD_STATE: dict[str, int] = {"req_id": 0}
 
 
+def _clean_flow(config: Any, name: str) -> str:
+    """清残留 flow 目录后重建：崩溃/被杀留下的 session 文件会让
+    CTP CreateFtdcXxxApi/Init 挂起（实踩：日盘复现 worker 无任何输出）。"""
+    import os
+    import shutil
+
+    path = os.path.join(config.flow_dir, name)
+    shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _run_td(q: Any, cmd_q: Any, config: Any, lifetime: float | None) -> None:
     """交易子进程：认证 → 登录 → 结算单确认 → 指令循环。"""
     from openctp_ctp.thosttraderapi import (
@@ -220,7 +232,7 @@ def _run_td(q: Any, cmd_q: Any, config: Any, lifetime: float | None) -> None:
             logger.warning("[ctp-worker-td] 连接断开 reason=%s", nReason)
             q.put({"type": DISCONNECTED, "reason": int(nReason)})
 
-    api = CThostFtdcTraderApi.CreateFtdcTraderApi(config.flow_path("flow_td"))
+    api = CThostFtdcTraderApi.CreateFtdcTraderApi(_clean_flow(config, "flow_td"))
     spi = _TdSpi()  # 持引用
     api.RegisterSpi(spi)
     api.RegisterFront(config.trade_front)
@@ -262,6 +274,9 @@ def run_ctp_worker(
     import gc
 
     gc.disable()  # 约束 1
+
+    # 子进程入口：配置日志（spawn 子进程不继承父进程的 logging 配置）
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s %(message)s")
 
     if mode == "td":
         _run_td(q, cmd_q, config, lifetime)
@@ -317,7 +332,7 @@ def _run_md(q: Any, config: Any, contracts: list[str], lifetime: float | None) -
             logger.warning("[ctp-worker] 连接断开 reason=%s", nReason)
             q.put({"type": DISCONNECTED, "reason": int(nReason)})
 
-    api = CThostFtdcMdApi.CreateFtdcMdApi(config.flow_path("flow_md"))
+    api = CThostFtdcMdApi.CreateFtdcMdApi(_clean_flow(config, "flow_md"))
     spi = _Spi()  # 持引用（否则被 GC 后回调丢失）
     api.RegisterSpi(spi)
     api.RegisterFront(config.md_front)

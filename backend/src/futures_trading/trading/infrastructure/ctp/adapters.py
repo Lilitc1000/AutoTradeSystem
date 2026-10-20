@@ -487,9 +487,10 @@ class CtpTradeGateway(OrderPort):
         order = self._orders.get(order_id)
         if order is None:
             raise KeyError(f"订单不存在: {order_id}")
-        if self._api is None:
+        if self._worker is None or not self._ready.is_set():
             raise RuntimeError("交易会话未就绪")
-        _md, trade = _load_ctp()
+        # 父进程不碰 CTP so（field 构造全在 worker 侧）——纯指令下发，
+        # 这也是父进程退出不 segfault 的关键（atexit 析构只存在于子进程）
         values = {
             "BrokerID": self.config.broker_id,
             "InvestorID": self.config.user_id,
@@ -500,7 +501,6 @@ class CtpTradeGateway(OrderPort):
             "FrontID": self._front_id,
             "SessionID": self._session_id,
         }
-        self._request_id += 1
         self._send_cmd("cancel", values)
         return order
 
@@ -818,7 +818,10 @@ class CtpTradeGateway(OrderPort):
                 await self.bus.publish("trade.fill", inner)
                 continue
             if isinstance(item, dict):
-                await self._handle_report(item)
+                try:
+                    await self._handle_report(item)
+                except Exception:  # noqa: BLE001  # 单条回报异常不杀死消费协程
+                    logger.exception("回报处理异常: %s", item.get("type"))
 
     async def _handle_report(self, item: dict[str, Any]) -> None:
         """分发 worker 上报消息。"""

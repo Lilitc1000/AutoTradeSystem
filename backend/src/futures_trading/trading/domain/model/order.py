@@ -126,6 +126,10 @@ class Order:
             total = self.filled_quantity * self.avg_fill_price + qty * px
             self.avg_fill_price = total / (self.filled_quantity + qty)
         self.filled_quantity = Quantity(self.filled_quantity + qty)
+        if self.status is OrderStatus.PENDING:
+            # 成交回报可能先于委托确认到达（CTP 回报乱序）——
+            # 成交前必先提交，补一次合法迁移
+            self._transition(OrderStatus.SUBMITTED)
         if self.filled_quantity == self.quantity:
             self._transition(OrderStatus.FILLED)
         else:
